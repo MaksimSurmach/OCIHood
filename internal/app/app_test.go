@@ -2,22 +2,39 @@ package app
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 )
 
-func TestRunSeparatesResultAndDiagnostics(t *testing.T) {
+func TestRunnerRun(t *testing.T) {
 	t.Parallel()
 
-	var stdout, stderr bytes.Buffer
-	if err := Run(&stdout, &stderr); err != nil {
+	var logs bytes.Buffer
+	runner := NewRunner(slog.New(slog.NewTextHandler(&logs, nil)))
+
+	result, err := runner.Run(t.Context())
+	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-
-	if got, want := stdout.String(), "ocihood\n"; got != want {
-		t.Errorf("stdout = %q, want %q", got, want)
+	if result != "ocihood\n" {
+		t.Errorf("result = %q, want %q", result, "ocihood\n")
 	}
-	if got := stderr.String(); !strings.Contains(got, "level=INFO msg=\"OCIHood started\"") {
-		t.Errorf("stderr = %q, want text slog message", got)
+	if !strings.Contains(logs.String(), "level=INFO msg=\"OCIHood started\"") {
+		t.Errorf("logs = %q, want start message", logs.String())
+	}
+}
+
+func TestRunnerRunCanceled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	runner := NewRunner(slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	if _, err := runner.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
 	}
 }
