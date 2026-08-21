@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
+	"github.com/MaksimSurmach/OCIHood/internal/cli"
 )
 
 func main() {
-	if err := app.Run(os.Stdout, os.Stderr); err != nil {
-		slog.New(slog.NewTextHandler(os.Stderr, nil)).Error("command failed", "error", err)
-		os.Exit(1)
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	exitCode := cli.Execute(ctx, os.Args[1:], app.NewRunner(logger), os.Stdout, os.Stderr)
+	stop()
+	os.Exit(exitCode)
 }

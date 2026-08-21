@@ -1,18 +1,25 @@
 package app
 
 import (
-	"fmt"
-	"io"
+	"context"
 	"log/slog"
 )
 
-// Run executes the minimal OCIHood command.
-func Run(stdout, stderr io.Writer) error {
-	logger := slog.New(slog.NewTextHandler(stderr, nil))
-	logger.Info("OCIHood started")
+// Runner performs one OCIHood provisioning run.
+type Runner struct {
+	logger *slog.Logger
+}
 
-	if _, err := io.WriteString(stdout, "ocihood\n"); err != nil {
-		return fmt.Errorf("write command result: %w", err)
+// NewRunner creates the application runner.
+func NewRunner(logger *slog.Logger) *Runner {
+	return &Runner{logger: logger}
+}
+
+// Run performs one provisioning run.
+func (r *Runner) Run(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	return nil
+	r.logger.Info("OCIHood started")
+	return "ocihood\n", nil
 }
