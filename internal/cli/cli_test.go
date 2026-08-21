@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -13,6 +15,39 @@ type fakeRunner struct {
 	result string
 	err    error
 	run    func(context.Context) (string, error)
+}
+
+func TestConfigCommands(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("accounts:\n  test:\n    oci_profile: TEST\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "validate", args: []string{"--config", path, "config", "validate"}},
+		{name: "show", args: []string{"config", "show", "--config", path, "--account", "test"}, want: "oci_profile: TEST\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runner := &fakeRunner{}
+			var stdout, stderr bytes.Buffer
+			if code := Execute(t.Context(), tt.args, runner, &stdout, &stderr); code != 0 {
+				t.Fatalf("Execute() code = %d, stderr = %q", code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), tt.want) {
+				t.Fatalf("stdout = %q, want substring %q", stdout.String(), tt.want)
+			}
+			if runner.calls != 0 {
+				t.Fatalf("runner calls = %d, want 0", runner.calls)
+			}
+		})
+	}
 }
 
 func (f *fakeRunner) Run(ctx context.Context) (string, error) {

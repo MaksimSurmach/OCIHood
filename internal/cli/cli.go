@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -30,6 +31,7 @@ func Execute(ctx context.Context, args []string, runner Runner, stdout, stderr i
 }
 
 func newRootCommand(runner Runner) *cobra.Command {
+	var configPath string
 	root := &cobra.Command{
 		Use:           "ocihood",
 		Short:         "Provision Oracle Cloud Infrastructure resources",
@@ -40,6 +42,7 @@ func newRootCommand(runner Runner) *cobra.Command {
 			return cmd.Help()
 		},
 	}
+	root.PersistentFlags().StringVar(&configPath, "config", "", "configuration file (default: OS user config directory/ocihood/config.yaml)")
 
 	root.AddCommand(&cobra.Command{
 		Use:   "start",
@@ -58,6 +61,54 @@ func newRootCommand(runner Runner) *cobra.Command {
 			return nil
 		},
 	})
+	root.AddCommand(newConfigCommand(&configPath))
 
 	return root
+}
+
+func newConfigCommand(configPath *string) *cobra.Command {
+	command := &cobra.Command{Use: "config", Short: "Inspect and validate configuration", Args: cobra.NoArgs}
+	command.AddCommand(&cobra.Command{
+		Use: "validate", Short: "Validate configuration without contacting OCI", Args: cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			path, err := config.Path(*configPath)
+			if err != nil {
+				return err
+			}
+			if _, err := config.Load(path); err != nil {
+				return err
+			}
+			return nil
+		},
+	})
+	var account string
+	show := &cobra.Command{
+		Use: "show", Short: "Show effective non-secret account configuration", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, err := config.Path(*configPath)
+			if err != nil {
+				return err
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				return err
+			}
+			effective, err := cfg.Resolve(account)
+			if err != nil {
+				return err
+			}
+			out, err := config.MarshalEffective(effective)
+			if err != nil {
+				return err
+			}
+			if _, err := cmd.OutOrStdout().Write(out); err != nil {
+				return fmt.Errorf("write effective config: %w", err)
+			}
+			return nil
+		},
+	}
+	show.Flags().StringVar(&account, "account", "", "account name")
+	_ = show.MarkFlagRequired("account")
+	command.AddCommand(show)
+	return command
 }
