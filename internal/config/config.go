@@ -52,6 +52,14 @@ type Account struct {
 	Region            string   `yaml:"region,omitempty"`
 	SSHPublicKeyPath  string   `yaml:"ssh_public_key_path,omitempty"`
 	SSHPrivateKeyPath string   `yaml:"ssh_private_key_path,omitempty"`
+	CompartmentID     string   `yaml:"compartment_id,omitempty"`
+	ImageID           string   `yaml:"image_id,omitempty"`
+	OperatingSystem   string   `yaml:"operating_system,omitempty"`
+	OSVersion         string   `yaml:"os_version,omitempty"`
+	VCNID             string   `yaml:"vcn_id,omitempty"`
+	VCNName           string   `yaml:"vcn_name,omitempty"`
+	SubnetID          string   `yaml:"subnet_id,omitempty"`
+	SubnetName        string   `yaml:"subnet_name,omitempty"`
 	Overrides         Settings `yaml:"overrides"`
 }
 
@@ -63,6 +71,14 @@ type Effective struct {
 	Region            string        `yaml:"region,omitempty"`
 	SSHPublicKeyPath  string        `yaml:"ssh_public_key_path,omitempty"`
 	SSHPrivateKeyPath string        `yaml:"ssh_private_key_path,omitempty"`
+	CompartmentID     string        `yaml:"compartment_id,omitempty"`
+	ImageID           string        `yaml:"image_id,omitempty"`
+	OperatingSystem   string        `yaml:"operating_system,omitempty"`
+	OSVersion         string        `yaml:"os_version,omitempty"`
+	VCNID             string        `yaml:"vcn_id,omitempty"`
+	VCNName           string        `yaml:"vcn_name,omitempty"`
+	SubnetID          string        `yaml:"subnet_id,omitempty"`
+	SubnetName        string        `yaml:"subnet_name,omitempty"`
 	RequestTimeout    time.Duration `yaml:"request_timeout"`
 	RetryMin          time.Duration `yaml:"retry_min"`
 	RetryMax          time.Duration `yaml:"retry_max"`
@@ -133,6 +149,12 @@ func (f File) Validate() error {
 		if err := validateSettings("account "+name+" overrides", account.Overrides); err != nil {
 			return err
 		}
+		if account.VCNID != "" && account.VCNName != "" {
+			return fmt.Errorf("account %q vcn_id and vcn_name are mutually exclusive", name)
+		}
+		if account.SubnetID != "" && account.SubnetName != "" {
+			return fmt.Errorf("account %q subnet_id and subnet_name are mutually exclusive", name)
+		}
 		if _, err := f.Resolve(name); err != nil {
 			return err
 		}
@@ -193,6 +215,14 @@ func (f File) Resolve(name string) (Effective, error) {
 	e.Region = account.Region
 	e.SSHPublicKeyPath = account.SSHPublicKeyPath
 	e.SSHPrivateKeyPath = account.SSHPrivateKeyPath
+	e.CompartmentID = account.CompartmentID
+	e.ImageID = account.ImageID
+	e.OperatingSystem = account.OperatingSystem
+	e.OSVersion = account.OSVersion
+	e.VCNID = account.VCNID
+	e.VCNName = account.VCNName
+	e.SubnetID = account.SubnetID
+	e.SubnetName = account.SubnetName
 	if e.RetryMin > e.RetryMax {
 		return Effective{}, fmt.Errorf("account %q retry_min must not exceed retry_max", name)
 	}

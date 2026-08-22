@@ -25,12 +25,23 @@ accounts:
     region: eu-frankfurt-1
     ssh_public_key_path: /home/me/.ssh/id_ed25519.pub
     ssh_private_key_path: /home/me/.ssh/id_ed25519
+    compartment_id: ocid1.compartment.oc1..example
+    operating_system: Oracle Linux
+    os_version: "9"
+    vcn_name: main
+    subnet_name: public
     overrides:
       memory_gb: 8
 ```
 
 Credential and SSH values are references only; OCIHood never copies their contents into
 project configuration or `config show` output.
+
+Discovery is read-only and paginates every OCI list operation. Explicit image, VCN and subnet
+OCIDs take precedence. VCN/subnet names must resolve uniquely. With OS filters, image selection
+uses descending display name (newest OCI platform-image name) and image OCID as a stable tie-breaker;
+without filters, multiple images are rejected as ambiguous. All availability domains are retained
+in sorted order for later rotation.
 
 ## Desired-resource identity and reconciliation
 
