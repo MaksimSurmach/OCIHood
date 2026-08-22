@@ -17,6 +17,7 @@ type fakeProvider struct {
 	instances map[string]Page[Instance]
 	fail      string
 	calls     []string
+	queries   []Query
 }
 
 func (f *fakeProvider) AvailabilityDomains(context.Context, string) ([]string, error) {
@@ -26,8 +27,9 @@ func (f *fakeProvider) AvailabilityDomains(context.Context, string) ([]string, e
 	}
 	return f.ads, nil
 }
-func (f *fakeProvider) Images(_ context.Context, _ Query, p string) (Page[Image], error) {
+func (f *fakeProvider) Images(_ context.Context, q Query, p string) (Page[Image], error) {
 	f.calls = append(f.calls, "images:"+p)
+	f.queries = append(f.queries, q)
 	if f.fail == "images" {
 		return Page[Image]{}, errors.New("boom")
 	}
@@ -94,6 +96,24 @@ func TestDiscoverSelectionFailures(t *testing.T) {
 	}{
 		{"zero images", func(f *fakeProvider, _ *Input) { f.images = map[string]Page[Image]{"": {}} }, KindNotFound},
 		{"explicit incompatible image", func(f *fakeProvider, in *Input) { in.ImageID = "missing" }, KindNotFound},
+		{"explicit image in wrong compartment", func(f *fakeProvider, in *Input) {
+			in.ImageID = "image-old"
+			x := f.images[""].Items[0]
+			x.CompartmentID = "other"
+			f.images[""] = Page[Image]{Items: []Image{x}}
+		}, KindNotFound},
+		{"explicit VCN in wrong compartment", func(f *fakeProvider, in *Input) {
+			in.VCNID, in.VCNName = "vcn", ""
+			x := f.vcns[""].Items[0]
+			x.CompartmentID = "other"
+			f.vcns[""] = Page[VCN]{Items: []VCN{x}}
+		}, KindNotFound},
+		{"explicit subnet in wrong VCN", func(f *fakeProvider, in *Input) {
+			in.SubnetID, in.SubnetName = "subnet", ""
+			x := f.subnets[""].Items[0]
+			x.VCNID = "other"
+			f.subnets[""] = Page[Subnet]{Items: []Subnet{x}}
+		}, KindNotFound},
 		{"ambiguous unfiltered image", func(_ *fakeProvider, in *Input) { in.OperatingSystem = ""; in.OSVersion = "" }, KindAmbiguous},
 		{"ambiguous VCN", func(f *fakeProvider, in *Input) {
 			in.VCNName = ""
@@ -159,6 +179,8 @@ func TestDiscoverProviderErrorsAndCancellation(t *testing.T) {
 func TestExplicitOverrides(t *testing.T) {
 	f, in := fixture()
 	in.ImageID = "image-old"
+	in.OperatingSystem = "Ubuntu"
+	in.OSVersion = "24.04"
 	in.VCNID = "vcn"
 	in.VCNName = ""
 	in.SubnetID = "subnet"
@@ -169,5 +191,8 @@ func TestExplicitOverrides(t *testing.T) {
 	}
 	if got.Image.ID != "image-old" || got.VCN.ID != "vcn" || got.Subnet.ID != "subnet" {
 		t.Fatalf("overrides ignored: %#v", got)
+	}
+	if f.queries[0].OperatingSystem != "" || f.queries[0].OSVersion != "" || f.queries[0].Shape != in.Shape {
+		t.Fatalf("explicit image query applied optional filters: %#v", f.queries[0])
 	}
 }

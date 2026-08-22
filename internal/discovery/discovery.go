@@ -91,8 +91,12 @@ func Discover(ctx context.Context, provider Provider, in Input) (Result, error) 
 	}
 	sort.Strings(ads)
 
+	imageQuery := Query{CompartmentID: in.CompartmentID, Shape: in.Shape}
+	if in.ImageID == "" {
+		imageQuery.OperatingSystem, imageQuery.OSVersion = in.OperatingSystem, in.OSVersion
+	}
 	images, err := all(ctx, "images", func(page string) (Page[Image], error) {
-		return provider.Images(ctx, Query{CompartmentID: in.CompartmentID, Shape: in.Shape, OperatingSystem: in.OperatingSystem, OSVersion: in.OSVersion}, page)
+		return provider.Images(ctx, imageQuery, page)
 	})
 	if err != nil {
 		return Result{}, err
@@ -180,10 +184,10 @@ func all[T any](ctx context.Context, stage string, fetch func(string) (Page[T], 
 }
 
 func selectImage(items []Image, in Input) (Image, error) {
-	items = keepImages(items, in)
 	if in.ImageID != "" {
 		return exactImage(items, in.ImageID, in.CompartmentID)
 	}
+	items = keepImages(items, in)
 	if len(items) == 0 {
 		return Image{}, fail(KindNotFound, "image selection", "no compatible image found")
 	}
@@ -208,9 +212,9 @@ func keepImages(items []Image, in Input) []Image {
 	}
 	return out
 }
-func exactImage(items []Image, id, _ string) (Image, error) {
+func exactImage(items []Image, id, compartmentID string) (Image, error) {
 	for _, x := range items {
-		if x.ID == id {
+		if x.ID == id && x.CompartmentID == compartmentID {
 			return x, nil
 		}
 	}
