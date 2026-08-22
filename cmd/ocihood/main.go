@@ -27,7 +27,8 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	runner := app.NewRunner(logger, func(_ context.Context, path, account string) (config.Effective, error) {
+	var runner *app.Runner
+	runner = app.NewRunner(logger, func(_ context.Context, path, account string) (config.Effective, error) {
 		resolvedPath, err := config.Path(path)
 		if err != nil {
 			return config.Effective{}, err
@@ -51,7 +52,7 @@ func main() {
 			OSVersion: effective.OSVersion, VCNID: effective.VCNID, VCNName: effective.VCNName,
 			SubnetID: effective.SubnetID, SubnetName: effective.SubnetName, PublicIP: effective.PublicIP,
 		})
-	}, func(ctx context.Context, bootstrapper provisioner.Bootstrapper, effective config.Effective, discovered discovery.Result) (capacity.Result, error) {
+	}, func(ctx context.Context, bootstrapper provisioner.Bootstrapper, effective config.Effective, discovered discovery.Result, once bool) (capacity.Result, error) {
 		clients, ok := bootstrapper.(*auth.Clients)
 		if !ok {
 			return capacity.Result{}, fmt.Errorf("authenticated provider has unsupported type %T", bootstrapper)
@@ -66,8 +67,8 @@ func main() {
 				resume.NextAD = (index + 1) % len(discovered.AvailabilityDomains)
 			}
 		}
-		watcher := capacity.Watcher{Client: ocicapacity.New(clients), Store: store, Sleeper: capacity.TimerSleeper{}, Random: capacity.CryptoRandom{}, Logger: logger, Now: time.Now, Config: capacity.Config{RequestTimeout: effective.RequestTimeout, InitialInterval: effective.RetryMin, MaxInterval: effective.RetryMax, Jitter: .2}}
-		return watcher.Watch(ctx, capacity.Input{TargetID: discovered.TargetID, TenancyID: discovered.TenancyID, Shape: effective.Shape, AvailabilityDomains: discovered.AvailabilityDomains, OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, Resume: resume})
+		watcher := capacity.Watcher{Client: ocicapacity.New(clients), Store: store, Sleeper: capacity.TimerSleeper{}, Random: capacity.CryptoRandom{}, Logger: runner.Logger(), Now: time.Now, Config: capacity.Config{RequestTimeout: effective.RequestTimeout, InitialInterval: effective.RetryMin, MaxInterval: effective.RetryMax, Jitter: .2}}
+		return watcher.Watch(ctx, capacity.Input{TargetID: discovered.TargetID, TenancyID: discovered.TenancyID, Shape: effective.Shape, AvailabilityDomains: discovered.AvailabilityDomains, OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, Resume: resume, Once: once})
 	})
 	runner.SetLaunch(func(ctx context.Context, bootstrapper provisioner.Bootstrapper, effective config.Effective, discovered discovery.Result, decision reconcile.Decision, placement capacity.Result, sshKey string) (launch.Instance, error) {
 		clients, ok := bootstrapper.(*auth.Clients)

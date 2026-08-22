@@ -75,7 +75,7 @@ func TestPlanIsDeterministicAndReadOnly(t *testing.T) {
 	var instances []reconcile.Instance
 	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
 		return discovery.Result{TargetID: targetID, CompartmentID: "compartment", Image: discovery.Image{ID: "image"}, VCN: discovery.VCN{ID: "vcn"}, Subnet: discovery.Subnet{ID: "subnet"}, AvailabilityDomains: []string{"AD-1"}, Instances: instances}, nil
-	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error) {
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, bool) (capacity.Result, error) {
 		provider.Create()
 		return capacity.Result{}, nil
 	})
@@ -198,7 +198,7 @@ func TestRunnerRunsCapacityWatcherOnlyForCreateSafeDecision(t *testing.T) {
 	calls := 0
 	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
 		return discovery.Result{TargetID: "target", TenancyID: "root", AvailabilityDomains: []string{"AD-1"}}, nil
-	}, func(ctx context.Context, gotProvider provisioner.Bootstrapper, gotEffective config.Effective, gotDiscovery discovery.Result) (capacity.Result, error) {
+	}, func(ctx context.Context, gotProvider provisioner.Bootstrapper, gotEffective config.Effective, gotDiscovery discovery.Result, _ bool) (capacity.Result, error) {
 		calls++
 		if gotProvider != provider || gotEffective.Account != "personal" || gotDiscovery.TargetID != "target" || ctx.Err() != nil {
 			t.Fatalf("capacity inputs are wrong")
@@ -214,6 +214,35 @@ func TestRunnerRunsCapacityWatcherOnlyForCreateSafeDecision(t *testing.T) {
 	}
 }
 
+func TestRunnerOnceReturnsNoCapacityWithoutLaunching(t *testing.T) {
+	t.Parallel()
+	key := filepath.Join(t.TempDir(), "id.pub")
+	if err := os.WriteFile(key, []byte("ssh-ed25519 test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir(), SSHPublicKeyPath: key}
+	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
+	watches, launches := 0, 0
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	}, func(_ context.Context, _ provisioner.Bootstrapper, _ config.Effective, _ discovery.Result, once bool) (capacity.Result, error) {
+		watches++
+		if !once {
+			t.Fatal("once mode not propagated")
+		}
+		return capacity.Result{Kind: capacity.Unavailable}, nil
+	})
+	runner.SetLaunch(func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, reconcile.Decision, capacity.Result, string) (launch.Instance, error) {
+		launches++
+		return launch.Instance{}, nil
+	})
+
+	got, err := runner.Run(t.Context(), Request{Account: "personal", Once: true})
+	if err != nil || got.Capacity != capacity.Unavailable || watches != 1 || launches != 0 {
+		t.Fatalf("result=%+v watches=%d launches=%d err=%v", got, watches, launches, err)
+	}
+}
+
 func TestRunnerFullProvisioningFlow(t *testing.T) {
 	t.Parallel()
 	sshKey := filepath.Join(t.TempDir(), "id.pub")
@@ -224,7 +253,7 @@ func TestRunnerFullProvisioningFlow(t *testing.T) {
 	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
 	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
 		return discovery.Result{TargetID: "target", TenancyID: "root", CompartmentID: "compartment", Image: discovery.Image{ID: "image"}, Subnet: discovery.Subnet{ID: "subnet"}, AvailabilityDomains: []string{"AD-1"}}, nil
-	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error) {
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, bool) (capacity.Result, error) {
 		return capacity.Result{Kind: capacity.Available, AvailabilityDomain: "AD-1"}, nil
 	})
 	runner.SetLaunch(func(_ context.Context, gotProvider provisioner.Bootstrapper, _ config.Effective, gotDiscovery discovery.Result, decision reconcile.Decision, placement capacity.Result, key string) (launch.Instance, error) {
@@ -254,7 +283,7 @@ func TestRunnerCapacityRaceReturnsToWatcher(t *testing.T) {
 	var attempts []reconcile.Attempt
 	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
 		return discovery.Result{TargetID: "target"}, nil
-	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error) {
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, bool) (capacity.Result, error) {
 		watches++
 		return capacity.Result{Kind: capacity.Available, AvailabilityDomain: fmt.Sprintf("AD-%d", watches)}, nil
 	})

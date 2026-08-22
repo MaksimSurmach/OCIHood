@@ -3,15 +3,19 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
+	"github.com/MaksimSurmach/OCIHood/internal/capacity"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
+	"github.com/MaksimSurmach/OCIHood/internal/launch"
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
 	"github.com/spf13/cobra"
@@ -33,6 +37,10 @@ func Execute(ctx context.Context, args []string, runner Runner, stdout, stderr i
 
 	if err := cmd.Execute(); err != nil {
 		_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
+		var exit *exitError
+		if errors.As(err, &exit) {
+			return exit.code
+		}
 		return 1
 	}
 	return 0
@@ -42,6 +50,7 @@ func newRootCommand(runner Runner) *cobra.Command {
 	var configPath string
 	var account string
 	var values startValues
+	var execution executionValues
 	root := &cobra.Command{
 		Use:           "ocihood",
 		Short:         "Provision Oracle Cloud Infrastructure resources",
@@ -60,19 +69,37 @@ func newRootCommand(runner Runner) *cobra.Command {
 		Long:  "Start one provisioning run. Explicit flags override account settings, global settings, and built-in defaults. A config file is optional when required inputs are supplied as flags.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			overrides, configless := values.overrides(cmd)
-			result, err := runner.Run(cmd.Context(), app.Request{ConfigPath: configPath, Account: account, Overrides: overrides, Configless: configPath == "" && configless})
+			logger, err := execution.logger(cmd.ErrOrStderr())
 			if err != nil {
-				return fmt.Errorf("start provisioning run: %w", err)
+				return err
 			}
-			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "account %s provisioning complete (region %s, instance %s, state %s, public_ip %s)\n", result.Account, result.Region, result.InstanceID, result.InstanceState, result.PublicIP); err != nil {
+			if configurable, ok := runner.(interface{ SetLogger(*slog.Logger) }); ok {
+				configurable.SetLogger(logger)
+			}
+			overrides, configless := values.overrides(cmd)
+			ctx := cmd.Context()
+			if execution.maxRuntime < 0 {
+				return errors.New("--max-runtime must not be negative")
+			}
+			if execution.maxRuntime > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, execution.maxRuntime)
+				defer cancel()
+			}
+			result, runErr := runner.Run(ctx, app.Request{ConfigPath: configPath, Account: account, Overrides: overrides, Configless: configPath == "" && configless, Once: execution.once})
+			document, code := commandResult(account, result, runErr)
+			if err := execution.write(cmd.OutOrStdout(), document); err != nil {
 				return fmt.Errorf("write command result: %w", err)
+			}
+			if runErr != nil || code != 0 {
+				return &exitError{code: code, message: document.Error.Message}
 			}
 			return nil
 		},
 	}
 	start.Flags().StringVar(&account, "account", "", "account name")
 	values.bind(start)
+	execution.bind(start)
 	_ = start.MarkFlagRequired("account")
 	root.AddCommand(start)
 	plan := &cobra.Command{
@@ -95,6 +122,111 @@ func newRootCommand(runner Runner) *cobra.Command {
 	root.AddCommand(newStatusCommand(&configPath))
 
 	return root
+}
+
+const resultSchema = "ocihood.start/v1"
+
+type commandDocument struct {
+	Schema        string `json:"schema"`
+	Account       string `json:"account"`
+	TargetID      string `json:"target_id,omitempty"`
+	Outcome       string `json:"outcome"`
+	Region        string `json:"region,omitempty"`
+	InstanceID    string `json:"instance_id,omitempty"`
+	InstanceState string `json:"instance_state,omitempty"`
+	PublicIP      string `json:"public_ip,omitempty"`
+	Error         struct {
+		Category string `json:"category,omitempty"`
+		Message  string `json:"message,omitempty"`
+	} `json:"error,omitempty"`
+}
+
+type exitError struct {
+	code    int
+	message string
+}
+
+func (e *exitError) Error() string { return e.message }
+
+type executionValues struct {
+	once                            bool
+	maxRuntime                      time.Duration
+	logLevel, logFormat, outputMode string
+}
+
+func (v *executionValues) bind(command *cobra.Command) {
+	f := command.Flags()
+	f.BoolVar(&v.once, "once", false, "perform one capacity decision cycle")
+	f.DurationVar(&v.maxRuntime, "max-runtime", 0, "maximum run duration (zero means unlimited)")
+	f.StringVar(&v.logLevel, "log-level", "info", "diagnostic level: debug, info, warn, error")
+	f.StringVar(&v.logFormat, "log-format", "text", "diagnostic format: text or json")
+	f.StringVar(&v.outputMode, "output", "text", "final result format: text or json")
+}
+
+func (v executionValues) logger(stderr io.Writer) (*slog.Logger, error) {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(v.logLevel)); err != nil {
+		return nil, fmt.Errorf("invalid --log-level %q", v.logLevel)
+	}
+	opts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	switch v.logFormat {
+	case "text":
+		handler = slog.NewTextHandler(stderr, opts)
+	case "json":
+		handler = slog.NewJSONHandler(stderr, opts)
+	default:
+		return nil, fmt.Errorf("invalid --log-format %q", v.logFormat)
+	}
+	if v.outputMode != "text" && v.outputMode != "json" {
+		return nil, fmt.Errorf("invalid --output %q", v.outputMode)
+	}
+	return slog.New(handler), nil
+}
+
+func (v executionValues) write(out io.Writer, result commandDocument) error {
+	if v.outputMode == "json" {
+		return json.NewEncoder(out).Encode(result)
+	}
+	if result.Error.Category != "" {
+		_, err := fmt.Fprintf(out, "account %s provisioning %s (%s: %s)\n", result.Account, result.Outcome, result.Error.Category, result.Error.Message)
+		return err
+	}
+	_, err := fmt.Fprintf(out, "account %s provisioning %s (region %s, instance %s, state %s, public_ip %s)\n", result.Account, result.Outcome, result.Region, result.InstanceID, result.InstanceState, result.PublicIP)
+	return err
+}
+
+func commandResult(account string, result app.Result, err error) (commandDocument, int) {
+	doc := commandDocument{Schema: resultSchema, Account: account, TargetID: result.TargetID, Outcome: "success", Region: result.Region, InstanceID: result.InstanceID, InstanceState: result.InstanceState, PublicIP: result.PublicIP}
+	if err == nil {
+		if result.Decision == reconcile.DecisionAlreadySatisfied {
+			doc.Outcome = "already_satisfied"
+		}
+		if result.Capacity == capacity.Unavailable {
+			doc.Outcome = "no_capacity"
+			return doc, 3
+		}
+		return doc, 0
+	}
+	doc.Outcome, doc.Error.Category, doc.Error.Message = "failed", "fatal", "provisioning failed"
+	code := 1
+	if errors.Is(err, context.DeadlineExceeded) {
+		doc.Outcome, doc.Error.Category, doc.Error.Message, code = "deadline_exceeded", "deadline", "maximum runtime exceeded", 124
+	} else if errors.Is(err, context.Canceled) {
+		doc.Outcome, doc.Error.Category, doc.Error.Message, code = "canceled", "canceled", "provisioning canceled", 130
+	} else {
+		var capacityErr *capacity.Error
+		var launchErr *launch.Error
+		if errors.As(err, &capacityErr) && (capacityErr.Kind == capacity.Transient || capacityErr.Kind == capacity.Throttled) || errors.As(err, &launchErr) && (launchErr.Kind == launch.Transient || launchErr.Kind == launch.Ambiguous || launchErr.Kind == launch.OutOfCapacity) {
+			doc.Outcome, doc.Error.Category, doc.Error.Message, code = "retryable_failure", "transient", "retryable provider failure", 4
+		} else {
+			var appErr *app.Error
+			if errors.As(err, &appErr) {
+				doc.Error.Message = "provisioning failed during " + appErr.Phase
+			}
+		}
+	}
+	return doc, code
 }
 
 func renderAction(kind reconcile.DecisionKind) string {

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
+	"github.com/MaksimSurmach/OCIHood/internal/capacity"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
@@ -348,7 +350,7 @@ func TestStartSuccessWritesResultToStdout(t *testing.T) {
 	if runner.request != (app.Request{ConfigPath: "config.yaml", Account: "personal"}) {
 		t.Errorf("request = %+v", runner.request)
 	}
-	if got := stdout.String(); got != "account personal provisioning complete (region eu-frankfurt-1, instance ocid.instance, state RUNNING, public_ip 203.0.113.1)\n" {
+	if got := stdout.String(); got != "account personal provisioning success (region eu-frankfurt-1, instance ocid.instance, state RUNNING, public_ip 203.0.113.1)\n" {
 		t.Errorf("stdout = %q, want result", got)
 	}
 	if stderr.Len() != 0 {
@@ -368,11 +370,107 @@ func TestStartFailureWritesDiagnosticToStderr(t *testing.T) {
 	if runner.calls != 1 {
 		t.Errorf("runner calls = %d, want 1", runner.calls)
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want empty", stdout.String())
+	if !strings.Contains(stdout.String(), "provisioning failed (fatal: provisioning failed)") {
+		t.Errorf("stdout = %q, want sanitized result", stdout.String())
 	}
-	if got := stderr.String(); !strings.Contains(got, "start provisioning run: service unavailable") {
+	if got := stderr.String(); !strings.Contains(got, "Error: provisioning failed") || strings.Contains(got, "service unavailable") {
 		t.Errorf("stderr = %q, want useful diagnostic", got)
+	}
+}
+
+func TestStartExecutionModesAndOutput(t *testing.T) {
+	t.Parallel()
+	t.Run("once reaches runner", func(t *testing.T) {
+		runner := &fakeRunner{result: app.Result{Account: "personal", Capacity: capacity.Unavailable}}
+		var stdout, stderr bytes.Buffer
+		if code := Execute(t.Context(), []string{"start", "--account", "personal", "--once"}, runner, &stdout, &stderr); code != 3 {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		if !runner.request.Once || !strings.Contains(stdout.String(), "no_capacity") {
+			t.Fatalf("request=%+v stdout=%q", runner.request, stdout.String())
+		}
+	})
+
+	t.Run("json result and json logs stay separated", func(t *testing.T) {
+		runner := &loggingRunner{result: app.Result{Account: "personal", TargetID: "target", Region: "region", InstanceID: "instance", InstanceState: "RUNNING"}}
+		var stdout, stderr bytes.Buffer
+		if code := Execute(t.Context(), []string{"start", "--account", "personal", "--output=json", "--log-format=json", "--log-level=debug"}, runner, &stdout, &stderr); code != 0 {
+			t.Fatalf("code=%d stderr=%q", code, stderr.String())
+		}
+		var result commandDocument
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("stdout is not JSON: %v: %q", err, stdout.String())
+		}
+		if result.Schema != resultSchema || result.TargetID != "target" || result.Outcome != "success" {
+			t.Fatalf("result=%+v", result)
+		}
+		var diagnostic map[string]any
+		if err := json.Unmarshal(stderr.Bytes(), &diagnostic); err != nil || diagnostic["msg"] != "diagnostic" {
+			t.Fatalf("stderr is not JSON diagnostics: %v: %q", err, stderr.String())
+		}
+	})
+
+	t.Run("max runtime returns deadline result", func(t *testing.T) {
+		runner := &fakeRunner{run: func(ctx context.Context, _ app.Request) (app.Result, error) {
+			<-ctx.Done()
+			return app.Result{}, ctx.Err()
+		}}
+		var stdout, stderr bytes.Buffer
+		if code := Execute(t.Context(), []string{"start", "--account", "personal", "--max-runtime=1ns"}, runner, &stdout, &stderr); code != 124 || !strings.Contains(stdout.String(), "deadline_exceeded") {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+	})
+}
+
+type loggingRunner struct {
+	logger *slog.Logger
+	result app.Result
+}
+
+func (r *loggingRunner) SetLogger(logger *slog.Logger) { r.logger = logger }
+func (r *loggingRunner) Run(context.Context, app.Request) (app.Result, error) {
+	r.logger.Debug("diagnostic")
+	return r.result, nil
+}
+func (*loggingRunner) Plan(context.Context, app.Request) (app.Plan, error) { return app.Plan{}, nil }
+
+func TestStartExitCodesAndSecretRedaction(t *testing.T) {
+	t.Parallel()
+	secret := "super-secret-token"
+	tests := []struct {
+		name string
+		err  error
+		code int
+		want string
+	}{
+		{name: "fatal", err: &app.Error{Phase: "authentication", Err: errors.New(secret)}, code: 1, want: "fatal"},
+		{name: "transient", err: &app.Error{Phase: "capacity", Err: &capacity.Error{Kind: capacity.Transient, Err: errors.New(secret)}}, code: 4, want: "transient"},
+		{name: "canceled", err: context.Canceled, code: 130, want: "canceled"},
+		{name: "deadline", err: context.DeadlineExceeded, code: 124, want: "deadline"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := Execute(t.Context(), []string{"start", "--account", "personal", "--output=json"}, &fakeRunner{err: tt.err}, &stdout, &stderr)
+			if code != tt.code || !strings.Contains(stdout.String(), tt.want) || strings.Contains(stdout.String()+stderr.String(), secret) {
+				t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestInvalidExecutionModesDoNotRunApplication(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"start", "--account", "personal", "--output=yaml"},
+		{"start", "--account", "personal", "--log-format=yaml"},
+		{"start", "--account", "personal", "--log-level=noisy"},
+		{"start", "--account", "personal", "--max-runtime=-1s"},
+	} {
+		runner := &fakeRunner{}
+		if code := Execute(t.Context(), args, runner, &bytes.Buffer{}, &bytes.Buffer{}); code == 0 || runner.calls != 0 {
+			t.Fatalf("args=%v code=%d calls=%d", args, code, runner.calls)
+		}
 	}
 }
 

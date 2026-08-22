@@ -96,6 +96,23 @@ func TestWatcherRotationBackoffAndRequest(t *testing.T) {
 	}
 }
 
+func TestWatcherOnceProbesEachADExactlyOnceWithoutSleeping(t *testing.T) {
+	now := time.Date(2026, 8, 22, 7, 0, 0, 0, time.UTC)
+	client := &fakeClient{results: []ProbeResult{{Kind: Unavailable}, {Kind: Throttled, RetryAfter: time.Hour}}, errs: []error{nil, errors.New("429")}}
+	store := &fakeStore{}
+	sleeper := &fakeSleeper{now: &now}
+	once := input()
+	once.Once = true
+
+	got, err := newWatcher(client, store, sleeper, &now).Watch(t.Context(), once)
+	if err != nil || got.Kind != Unavailable {
+		t.Fatalf("result=%+v err=%v", got, err)
+	}
+	if len(client.requests) != len(once.AvailabilityDomains) || len(sleeper.durations) != 0 {
+		t.Fatalf("requests=%d sleeps=%v", len(client.requests), sleeper.durations)
+	}
+}
+
 func TestWatcherClassificationRestartAndCancellation(t *testing.T) {
 	t.Run("probe unavailable returns safe fallback", func(t *testing.T) {
 		now := time.Now()
