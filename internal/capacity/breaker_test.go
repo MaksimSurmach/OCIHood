@@ -28,7 +28,7 @@ func TestWatcherSharesBreakerAcrossADRotationAndOwnsBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	sleeper := &fakeSleeper{now: &now}
 	sleeper.after = func() {
-		if len(sleeper.durations) == 2 {
+		if len(sleeper.durations) == 3 {
 			cancel()
 		}
 	}
@@ -38,7 +38,7 @@ func TestWatcherSharesBreakerAcrossADRotationAndOwnsBackoff(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 	gotADs := []string{provider.requests[0].AvailabilityDomain, provider.requests[1].AvailabilityDomain}
-	if !reflect.DeepEqual(gotADs, []string{"AD-1", "AD-2"}) || !reflect.DeepEqual(sleeper.durations, []time.Duration{time.Second, 2 * time.Second}) {
+	if len(provider.requests) != 2 || !reflect.DeepEqual(gotADs, []string{"AD-1", "AD-2"}) || !reflect.DeepEqual(sleeper.durations, []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}) {
 		t.Fatalf("provider ADs=%v sleeps=%v", gotADs, sleeper.durations)
 	}
 }
