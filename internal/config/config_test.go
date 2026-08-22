@@ -74,7 +74,7 @@ func TestBuiltInDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Shape != defaultShape || got.OCPUs != 2 || got.MemoryGB != 12 || got.BootVolumeGB != 50 || got.OCIProfile != "DEFAULT" || got.RequestTimeout != 30*time.Second {
+	if got.Shape != defaultShape || got.OCPUs != 2 || got.MemoryGB != 12 || got.BootVolumeGB != 50 || got.OCIProfile != "DEFAULT" || got.RequestTimeout != 30*time.Second || !reflect.DeepEqual(got.Policy.AllowedShapes, []string{defaultShape}) || got.Policy.MaxOCPUs != 2 || got.Policy.MaxMemoryGB != 12 || got.Policy.MaxBootGB != 50 {
 		t.Fatalf("defaults = %#v", got)
 	}
 }
@@ -94,6 +94,8 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		{name: "negative resources", body: "defaults:\n  ocpus: -1\n", want: "ocpus must be greater than zero"},
 		{name: "retry bounds", body: "defaults:\n  retry_min: 2m\n  retry_max: 1m\n", want: "defaults.retry_min must not exceed defaults.retry_max"},
 		{name: "cross layer retry bounds", body: "defaults:\n  retry_max: 1m\naccounts:\n  one:\n    overrides:\n      retry_min: 2m\n", want: "retry_min must not exceed retry_max"},
+		{name: "empty allowed shapes", body: "defaults:\n  policy:\n    allowed_shapes: []\n", want: "allowed_shapes must not be empty"},
+		{name: "invalid policy maximum", body: "defaults:\n  policy:\n    max_ocpus: 0\n", want: "max_ocpus must be greater than zero"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -101,6 +103,66 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 			_, err := Load(writeConfig(t, tt.body))
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("Load() error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestPolicyResolutionAndEvaluation(t *testing.T) {
+	t.Parallel()
+	cfg, err := Load(writeConfig(t, `
+defaults:
+  policy:
+    allowed_shapes: [global-shape]
+    max_ocpus: 4
+    max_memory_gb: 16
+    max_boot_volume_gb: 100
+accounts:
+  test:
+    overrides:
+      shape: account-shape
+      ocpus: 5
+      memory_gb: 17
+      boot_volume_gb: 101
+      policy:
+        allowed_shapes: [account-shape]
+        max_ocpus: 5
+        allow_exceed: true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := cfg.Resolve("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := EvaluatePolicy(effective)
+	if !decision.Allowed || !decision.Overridden || !reflect.DeepEqual(decision.Violations, []string{"memory_gb 17 exceeds maximum 16", "boot_volume_gb 101 exceeds maximum 100"}) {
+		t.Fatalf("effective=%+v decision=%+v", effective, decision)
+	}
+}
+
+func TestEvaluatePolicyBoundaries(t *testing.T) {
+	t.Parallel()
+	base := Effective{Shape: "shape", OCPUs: 2, MemoryGB: 8, BootVolumeGB: 50, Policy: Policy{AllowedShapes: []string{"shape"}, MaxOCPUs: 2, MaxMemoryGB: 8, MaxBootGB: 50}}
+	tests := []struct {
+		name string
+		edit func(*Effective)
+		want string
+	}{
+		{name: "within policy", edit: func(*Effective) {}},
+		{name: "shape", edit: func(e *Effective) { e.Shape = "other" }, want: `shape "other" is not allowed`},
+		{name: "ocpus", edit: func(e *Effective) { e.OCPUs++ }, want: "ocpus 3 exceeds maximum 2"},
+		{name: "memory", edit: func(e *Effective) { e.MemoryGB++ }, want: "memory_gb 9 exceeds maximum 8"},
+		{name: "boot volume", edit: func(e *Effective) { e.BootVolumeGB++ }, want: "boot_volume_gb 51 exceeds maximum 50"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			effective := base
+			tt.edit(&effective)
+			got := EvaluatePolicy(effective)
+			if (tt.want == "") != got.Allowed || tt.want != "" && !reflect.DeepEqual(got.Violations, []string{tt.want}) {
+				t.Fatalf("decision=%+v", got)
 			}
 		})
 	}
@@ -170,7 +232,7 @@ func TestApplyOverridesPrecedenceAndExplicitValues(t *testing.T) {
 	boolValue := func(value bool) *bool { return &value }
 	durationValue := func(value time.Duration) *time.Duration { return &value }
 
-	base := Effective{Account: "test", VCNName: "file-vcn", Shape: "file-shape", OCPUs: 4, MemoryGB: 8, BootVolumeGB: 50, PublicIP: true, RetryMin: time.Minute, RetryMax: 2 * time.Minute}
+	base := Effective{Account: "test", VCNName: "file-vcn", Shape: "file-shape", OCPUs: 4, MemoryGB: 8, BootVolumeGB: 50, PublicIP: true, RetryMin: time.Minute, RetryMax: 2 * time.Minute, Policy: Policy{AllowedShapes: []string{"file-shape", "cli-shape"}, MaxOCPUs: 4, MaxMemoryGB: 8, MaxBootGB: 50}}
 	tests := []struct {
 		name      string
 		overrides Overrides
@@ -181,6 +243,7 @@ func TestApplyOverridesPrecedenceAndExplicitValues(t *testing.T) {
 		{name: "all explicit values win", overrides: Overrides{Region: stringValue("eu-zurich-1"), Settings: Settings{Shape: stringValue("cli-shape"), OCPUs: intValue(2), PublicIP: boolValue(false), RetryMin: durationValue(30 * time.Second)}}, check: func(got Effective) bool {
 			return got.Region == "eu-zurich-1" && got.Shape == "cli-shape" && got.OCPUs == 2 && !got.PublicIP && got.RetryMin == 30*time.Second
 		}},
+		{name: "resource override is checked by policy", overrides: Overrides{Settings: Settings{OCPUs: intValue(5)}}, check: func(got Effective) bool { return got.OCPUs == 5 && !EvaluatePolicy(got).Allowed }},
 		{name: "explicit zero is validated", overrides: Overrides{Settings: Settings{OCPUs: intValue(0)}}, wantErr: "ocpus must be greater than zero"},
 		{name: "exclusive selector replaces lower layer", overrides: Overrides{VCNID: stringValue("id")}, check: func(got Effective) bool { return got.VCNID == "id" && got.VCNName == "" }},
 		{name: "cross-field validation", overrides: Overrides{VCNID: stringValue("id"), VCNName: stringValue("name")}, wantErr: "mutually exclusive"},

@@ -28,6 +28,12 @@ defaults:
   memory_gb: 12
   boot_volume_gb: 50
   public_ip: true
+  policy:
+    allowed_shapes: [VM.Standard.A1.Flex]
+    max_ocpus: 2
+    max_memory_gb: 12
+    max_boot_volume_gb: 50
+    allow_exceed: false
 accounts:
   personal:
     oci_config_path: /home/me/.oci/config
@@ -46,6 +52,13 @@ accounts:
 
 Credential and SSH values are references only; OCIHood never copies their contents into
 project configuration or `config show` output.
+
+The local policy is a configurable safety ceiling, not an Oracle price or Free Tier guarantee.
+Built-in limits match OCIHood's built-in resource defaults. `plan` reports the resolved values,
+policy decision and every violated rule. `start` rejects violations before capacity or launch;
+set `policy.allow_exceed: true` explicitly in global or account configuration to permit them.
+There is no interactive or implicit unattended override, and capacity retries never change the
+requested shape, OCPUs, memory or boot volume.
 
 Discovery is read-only and paginates every OCI list operation. Explicit image, VCN and subnet
 OCIDs take precedence. VCN/subnet names must resolve uniquely. With OS filters, image selection

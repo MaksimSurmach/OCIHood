@@ -39,15 +39,33 @@ func (f *fakeRunner) Plan(_ context.Context, request app.Request) (app.Plan, err
 
 func TestPlanCommandRendersDeterministicIntent(t *testing.T) {
 	t.Parallel()
-	runner := &fakeRunner{plan: app.Plan{Account: "personal", TargetID: "target", Region: "region", CompartmentID: "compartment", Shape: "shape", OCPUs: 2, MemoryGB: 12, ImageID: "image", VCNID: "vcn", SubnetID: "subnet", BootVolumeGB: 50, PublicIP: true, AvailabilityDomains: []string{"AD-1", "AD-2"}, Action: reconcile.DecisionCreate, Reason: "no active instance"}}
+	runner := &fakeRunner{plan: app.Plan{Account: "personal", TargetID: "target", Region: "region", CompartmentID: "compartment", Shape: "shape", OCPUs: 2, MemoryGB: 12, ImageID: "image", VCNID: "vcn", SubnetID: "subnet", BootVolumeGB: 50, PublicIP: true, Policy: config.PolicyDecision{Violations: []string{"ocpus 2 exceeds maximum 1"}}, AvailabilityDomains: []string{"AD-1", "AD-2"}, Action: reconcile.DecisionCreate, Reason: "no active instance"}}
 	var stdout, stderr bytes.Buffer
 	if code := Execute(t.Context(), []string{"--config", "config.yaml", "plan", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
-	for _, want := range []string{"target_id: target", "availability_domains: AD-1,AD-2", "action: create", "reason: no active instance"} {
+	for _, want := range []string{"target_id: target", "policy_decision: rejected", "policy_violations: ocpus 2 exceeds maximum 1", "availability_domains: AD-1,AD-2", "action: create", "reason: no active instance"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("output missing %q: %s", want, stdout.String())
 		}
+	}
+}
+
+func TestStartJSONExposesSanitizedPolicyRejection(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{run: func(context.Context, app.Request) (app.Result, error) {
+		return app.Result{Account: "personal", Region: "region", Policy: config.PolicyDecision{Violations: []string{"ocpus 8 exceeds maximum 2"}}}, &app.Error{Phase: "policy", Err: errors.New("resource policy rejected")}
+	}}
+	var stdout, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"start", "--account", "personal", "--output=json"}, runner, &stdout, &stderr); code != 1 {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	var document commandDocument
+	if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Policy == nil || document.Policy.Allowed || !reflect.DeepEqual(document.Policy.Violations, []string{"ocpus 8 exceeds maximum 2"}) || document.Error.Message != "provisioning failed during policy" || strings.Contains(stdout.String(), "resource policy rejected") {
+		t.Fatalf("document=%+v stdout=%q", document, stdout.String())
 	}
 }
 
