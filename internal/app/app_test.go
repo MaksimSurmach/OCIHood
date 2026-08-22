@@ -43,6 +43,47 @@ func TestNotificationFailureIsMetadataOnly(t *testing.T) {
 	}
 }
 
+func TestRunnerEmitsExactlyOneTerminalFailure(t *testing.T) {
+	tests := []struct {
+		name, phase  string
+		authenticate Authenticate
+		stateFailure bool
+	}{
+		{name: "authentication", phase: "authentication", authenticate: func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+			return nil, errors.New("private provider detail")
+		}},
+		{name: "state", phase: "state", authenticate: func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+			return &fakeBootstrapper{run: func(context.Context) error { return nil }}, nil
+		}, stateFailure: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			if tt.stateFailure {
+				stateDir = filepath.Join(t.TempDir(), "not-a-directory")
+				if err := os.WriteFile(stateDir, []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			effective := config.Effective{Account: "personal", Region: "region", StateDir: stateDir}
+			notifier := &fakeNotifier{}
+			runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, tt.authenticate, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+				return discovery.Result{TargetID: "target"}, nil
+			})
+			runner.SetNotifierFactory(func(config.Effective) notification.Notifier { return notifier })
+			if tt.stateFailure {
+				runner.SetLaunch(func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, reconcile.Decision, capacity.Result, string) (launch.Instance, error) {
+					return launch.Instance{}, nil
+				})
+			}
+			_, err := runner.Run(t.Context(), Request{Account: "personal"})
+			if err == nil || len(notifier.events) != 2 || notifier.events[0].Kind != notification.RunStarted || notifier.events[1].Kind != notification.TerminalFailure || notifier.events[1].Detail != tt.phase+" failed" || strings.Contains(notification.Format(notifier.events[1]), "private provider detail") {
+				t.Fatalf("error=%v events=%+v", err, notifier.events)
+			}
+		})
+	}
+}
+
 func (f *fakeNotifier) Notify(_ context.Context, event notification.Event) error {
 	f.events = append(f.events, event)
 	return f.err
