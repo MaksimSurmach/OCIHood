@@ -118,6 +118,14 @@ func (o Orchestrator) Run(ctx context.Context, in Input) (Instance, error) {
 			return Instance{}, &Error{Kind: Canceled, Err: err}
 		case Transient, Ambiguous, "":
 			delay := backoff(in.RetryMin, in.RetryMax, retry)
+			if delay == in.RetryMax {
+				if err == nil {
+					err = errors.New("launch retry budget exhausted")
+				} else {
+					err = fmt.Errorf("launch retry budget exhausted: %w", err)
+				}
+				return Instance{}, &Error{Kind: result.Kind, Err: err}
+			}
 			if result.RetryAfter > delay {
 				delay = result.RetryAfter
 			}

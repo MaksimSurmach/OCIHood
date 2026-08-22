@@ -128,6 +128,7 @@ func TestRunnerCapacityRaceReturnsToWatcher(t *testing.T) {
 	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir(), SSHPublicKeyPath: sshKey}
 	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
 	watches, launches := 0, 0
+	var attempts []reconcile.Attempt
 	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
 		return discovery.Result{TargetID: "target"}, nil
 	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error) {
@@ -139,6 +140,7 @@ func TestRunnerCapacityRaceReturnsToWatcher(t *testing.T) {
 		if decision.Attempt == nil {
 			t.Fatal("launch lost logical attempt")
 		}
+		attempts = append(attempts, *decision.Attempt)
 		if launches == 1 {
 			return launch.Instance{}, &launch.Error{Kind: launch.OutOfCapacity, Err: errors.New("capacity race")}
 		}
@@ -152,6 +154,12 @@ func TestRunnerCapacityRaceReturnsToWatcher(t *testing.T) {
 	}
 	if watches != 2 || launches != 2 {
 		t.Fatalf("watches=%d launches=%d", watches, launches)
+	}
+	if attempts[0].ID == attempts[1].ID || attempts[0].RetryToken == attempts[1].RetryToken {
+		t.Fatalf("capacity rotation reused attempt: %+v", attempts)
+	}
+	if got, err := state.New(effective.StateDir).Load(effective.Account, "target"); err != nil || got.AttemptID != attempts[1].ID || got.RetryToken != attempts[1].RetryToken {
+		t.Fatalf("persisted attempt=%+v err=%v", got, err)
 	}
 }
 

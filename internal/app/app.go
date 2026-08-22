@@ -157,6 +157,11 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 		instance, err = r.launchInstance(ctx, provider, effective, discovered, decision, capacityResult, string(sshKey))
 		var launchErr *launch.Error
 		if errors.As(err, &launchErr) && launchErr.Kind == launch.OutOfCapacity && createSafe {
+			attempt, persistErr := newAttemptAndPersist(effective, discovered.TargetID, r.random, r.now().UTC())
+			if persistErr != nil {
+				return Result{}, &Error{Phase: "state", Err: persistErr}
+			}
+			decision.Attempt = &attempt
 			continue
 		}
 		if err != nil {
@@ -167,6 +172,30 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 
 	r.logger.InfoContext(ctx, "provisioning run completed", "account", request.Account, "region", effective.Region)
 	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain, InstanceID: instance.ID, InstanceState: instance.State, PublicIP: instance.PublicIP}, nil
+}
+
+func newAttemptAndPersist(effective config.Effective, targetID string, random io.Reader, now time.Time) (reconcile.Attempt, error) {
+	attempt, err := reconcile.NewAttempt(random, now, attemptValidity)
+	if err != nil {
+		return reconcile.Attempt{}, err
+	}
+	store := state.New(effective.StateDir)
+	locked, err := store.TryLock(effective.Account, targetID)
+	if err != nil {
+		return reconcile.Attempt{}, err
+	}
+	defer func() { _ = locked.Close() }()
+	value, err := store.Load(effective.Account, targetID)
+	if err != nil {
+		return reconcile.Attempt{}, err
+	}
+	value.Lifecycle, value.AttemptID, value.RetryToken = state.Provisioning, attempt.ID, attempt.RetryToken
+	value.AttemptValidTo, value.LastAttempt, value.UpdatedAt = attempt.ValidUntil, now, now
+	value.InstanceID, value.LastError = "", ""
+	if err := locked.Save(value); err != nil {
+		return reconcile.Attempt{}, err
+	}
+	return attempt, nil
 }
 
 const attemptValidity = 24 * time.Hour

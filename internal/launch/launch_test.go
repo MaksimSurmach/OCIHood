@@ -124,6 +124,18 @@ func TestOrchestratorClassifiesAndCancels(t *testing.T) {
 			t.Fatalf("requests=%+v", provider.launchRequests)
 		}
 	})
+	t.Run("transient retries are bounded", func(t *testing.T) {
+		cause := errors.New("network")
+		provider := &fakeProvider{
+			launches:     []Result{{Kind: Transient}, {Kind: Transient}, {Kind: Transient}},
+			launchErrors: []error{cause, cause, cause},
+		}
+		_, err := (Orchestrator{Provider: provider, Store: &fakeStore{}, Sleeper: &fakeSleeper{}}).Run(t.Context(), validInput())
+		var got *Error
+		if !errors.As(err, &got) || got.Kind != Transient || !errors.Is(err, cause) || len(provider.launchRequests) != 3 {
+			t.Fatalf("err=%v launches=%d", err, len(provider.launchRequests))
+		}
+	})
 	t.Run("cancellation during retry", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		provider := &fakeProvider{launches: []Result{{Kind: Transient}}, launchErrors: []error{errors.New("network")}}
