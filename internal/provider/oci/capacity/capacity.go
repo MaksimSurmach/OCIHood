@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"strconv"
 	"time"
 
 	domain "github.com/MaksimSurmach/OCIHood/internal/capacity"
@@ -34,7 +36,11 @@ func (c *Client) Probe(ctx context.Context, request domain.Request) (domain.Prob
 		RequestMetadata: common.RequestMetadata{RetryPolicy: &noRetry},
 	})
 	if err != nil {
-		return classify(err)
+		result, classified := classify(err)
+		if result.Kind == domain.Throttled && response.RawResponse != nil {
+			result.RetryAfter = parseRetryAfter(response.RawResponse.Header.Get("Retry-After"), time.Now())
+		}
+		return result, classified
 	}
 	if len(response.ShapeAvailabilities) != 1 {
 		return domain.ProbeResult{Kind: domain.ProbeUnavailable}, nil
@@ -47,6 +53,18 @@ func (c *Client) Probe(ctx context.Context, request domain.Request) (domain.Prob
 	default:
 		return domain.ProbeResult{Kind: domain.ProbeUnavailable}, nil
 	}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	seconds, err := strconv.Atoi(value)
+	if err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	date, err := http.ParseTime(value)
+	if err != nil || !date.After(now) {
+		return 0
+	}
+	return date.Sub(now)
 }
 
 func classify(err error) (domain.ProbeResult, error) {

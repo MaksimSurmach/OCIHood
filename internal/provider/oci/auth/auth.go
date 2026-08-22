@@ -101,10 +101,12 @@ func New(account config.Effective) (*Clients, error) {
 		return nil, localError("create network client", err)
 	}
 
-	return &Clients{
+	clients := &Clients{
 		Identity: identityClient, Compute: computeClient, VirtualNetwork: networkClient,
-		TenancyOCID: tenancy, UserOCID: user, Region: region, identityReader: identityClient,
-	}, nil
+		TenancyOCID: tenancy, UserOCID: user, Region: region,
+	}
+	clients.identityReader = &clients.Identity
+	return clients, nil
 }
 
 func localError(op string, err error) error { return &Error{Kind: KindLocal, Op: op, err: err} }

@@ -17,3 +17,5 @@ require (
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 )
+
+replace github.com/oracle/oci-go-sdk/v65 => github.com/MaksimSurmach/oci-go-sdk/v65 v65.123.2-ocihood.1
