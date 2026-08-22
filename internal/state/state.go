@@ -77,6 +77,34 @@ type Locked struct {
 	closed  bool
 }
 
+// Guard excludes concurrent same-host provisioning runs for one account and target.
+type Guard struct{ lock *flock.Flock }
+
+func (s *Store) TryRunLock(account, targetID string) (*Guard, error) {
+	path, err := s.path(account, targetID)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create state directory: %w", err)
+	}
+	lock := flock.New(path + ".run.lock")
+	ok, err := lock.TryLock()
+	if err != nil {
+		return nil, fmt.Errorf("lock provisioning run: %w", err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("provisioning run for account %q target %s is already active", account, targetID)
+	}
+	if err := os.Chmod(path+".run.lock", 0o600); err != nil {
+		_ = lock.Unlock()
+		return nil, fmt.Errorf("restrict provisioning lock permissions: %w", err)
+	}
+	return &Guard{lock: lock}, nil
+}
+
+func (g *Guard) Close() error { return g.lock.Unlock() }
+
 func (s *Store) TryLock(account, targetID string) (*Locked, error) {
 	path, err := s.path(account, targetID)
 	if err != nil {

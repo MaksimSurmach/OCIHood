@@ -380,7 +380,7 @@ func TestCrashSafeProvisioningBoundaries(t *testing.T) {
 
 	t.Run("10 concurrent runners", func(t *testing.T) {
 		h := newCrashHarness(t)
-		entered := make(chan struct{}, 2)
+		entered := make(chan struct{}, 1)
 		release := make(chan struct{})
 		h.cloud.launchHook = func(_ context.Context, request launch.Request, _ int) (launch.Result, error) {
 			entered <- struct{}{}
@@ -391,16 +391,15 @@ func TestCrashSafeProvisioningBoundaries(t *testing.T) {
 		go func() { _, err := h.run(h.runner(nil, instantSleeper{}, nil)); errs <- err }()
 		<-entered
 		go func() { _, err := h.run(h.runner(nil, instantSleeper{}, nil)); errs <- err }()
-		<-entered
+		if err := <-errs; err == nil {
+			t.Fatal("concurrent runner entered mutating transaction")
+		}
 		close(release)
-		failures := 0
-		for range 2 {
-			if err := <-errs; err != nil {
-				failures++
-			}
+		if err := <-errs; err != nil {
+			t.Fatal(err)
 		}
 		requests := h.cloud.launchRequests()
-		if failures > 1 || len(requests) != 2 || requests[0].Attempt.RetryToken != requests[1].Attempt.RetryToken {
+		if len(requests) != 1 {
 			t.Fatalf("concurrent requests=%+v", requests)
 		}
 		h.assertSafe()
