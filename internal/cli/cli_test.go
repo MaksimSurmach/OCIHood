@@ -16,6 +16,7 @@ import (
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
+	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
 )
 
@@ -23,8 +24,29 @@ type fakeRunner struct {
 	calls   int
 	request app.Request
 	result  app.Result
+	plan    app.Plan
 	err     error
 	run     func(context.Context, app.Request) (app.Result, error)
+}
+
+func (f *fakeRunner) Plan(_ context.Context, request app.Request) (app.Plan, error) {
+	f.calls++
+	f.request = request
+	return f.plan, f.err
+}
+
+func TestPlanCommandRendersDeterministicIntent(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{plan: app.Plan{Account: "personal", TargetID: "target", Region: "region", CompartmentID: "compartment", Shape: "shape", OCPUs: 2, MemoryGB: 12, ImageID: "image", VCNID: "vcn", SubnetID: "subnet", BootVolumeGB: 50, PublicIP: true, AvailabilityDomains: []string{"AD-1", "AD-2"}, Action: reconcile.DecisionCreate, Reason: "no active instance"}}
+	var stdout, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"--config", "config.yaml", "plan", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	for _, want := range []string{"target_id: target", "availability_domains: AD-1,AD-2", "action: create", "reason: no active instance"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("output missing %q: %s", want, stdout.String())
+		}
+	}
 }
 
 type integrationBootstrapper struct{ calls int }

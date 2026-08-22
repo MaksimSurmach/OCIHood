@@ -23,7 +23,15 @@ import (
 )
 
 type fakeBootstrapper struct {
-	run func(context.Context) error
+	run                                   func(context.Context) error
+	createCalls, updateCalls, deleteCalls int
+}
+
+func (f *fakeBootstrapper) Create() { f.createCalls++ }
+func (f *fakeBootstrapper) Update() { f.updateCalls++ }
+func (f *fakeBootstrapper) Delete() { f.deleteCalls++ }
+func (f *fakeBootstrapper) mutationCalls() int {
+	return f.createCalls + f.updateCalls + f.deleteCalls
 }
 
 func TestConfiglessMissingRequiredInputStopsBeforeProvider(t *testing.T) {
@@ -58,6 +66,88 @@ func TestConfiglessMissingRequiredInputStopsBeforeProvider(t *testing.T) {
 }
 
 func pointer(value string) *string { return &value }
+
+func TestPlanIsDeterministicAndReadOnly(t *testing.T) {
+	t.Parallel()
+	effective := config.Effective{Account: "personal", Region: "region", CompartmentID: "compartment", StateDir: t.TempDir(), Shape: "shape", OCPUs: 2, MemoryGB: 12, BootVolumeGB: 50, PublicIP: true}
+	targetID := reconcile.Target{Account: "personal", Region: "region", CompartmentID: "compartment", SubnetID: "subnet", ImageID: "image", Shape: "shape", OCPUs: 2, MemoryGB: 12, BootVolumeGB: 50, PublicIP: true}.ID()
+	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
+	var instances []reconcile.Instance
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: targetID, CompartmentID: "compartment", Image: discovery.Image{ID: "image"}, VCN: discovery.VCN{ID: "vcn"}, Subnet: discovery.Subnet{ID: "subnet"}, AvailabilityDomains: []string{"AD-1"}, Instances: instances}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error) {
+		provider.Create()
+		return capacity.Result{}, nil
+	})
+	runner.SetLaunch(func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, reconcile.Decision, capacity.Result, string) (launch.Instance, error) {
+		provider.Update()
+		provider.Delete()
+		return launch.Instance{}, nil
+	})
+	first, err := runner.Plan(t.Context(), Request{Account: "personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := runner.Plan(t.Context(), Request{Account: "personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, second) || first.Action != reconcile.DecisionCreate || first.ImageID != "image" || first.SubnetID != "subnet" || provider.mutationCalls() != 0 {
+		t.Fatalf("plans=%+v / %+v mutations=%d", first, second, provider.mutationCalls())
+	}
+	if _, err := state.New(effective.StateDir).Load("personal", targetID); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("plan persisted state: %v", err)
+	}
+	tags := reconcile.OwnershipTags(targetID, "personal")
+	instances = []reconcile.Instance{{ID: "instance-1", Lifecycle: reconcile.LifecycleActive, Tags: tags}, {ID: "unrelated", Lifecycle: reconcile.LifecycleActive}}
+	satisfied, err := runner.Plan(t.Context(), Request{Account: "personal"})
+	if err != nil || satisfied.Action != reconcile.DecisionAlreadySatisfied || len(satisfied.Instances) != 1 {
+		t.Fatalf("already-satisfied plan=%+v err=%v", satisfied, err)
+	}
+	instances = append(instances, reconcile.Instance{ID: "instance-2", Lifecycle: reconcile.LifecycleActive, Tags: tags})
+	conflict, err := runner.Plan(t.Context(), Request{Account: "personal"})
+	if err != nil || conflict.Action != reconcile.DecisionConflict || provider.mutationCalls() != 0 {
+		t.Fatalf("conflict plan=%+v err=%v mutations=%d", conflict, err, provider.mutationCalls())
+	}
+}
+
+func TestPlanFailuresNeverMutateProvider(t *testing.T) {
+	t.Parallel()
+	for _, stage := range []string{"config", "authentication", "bootstrap", "discovery"} {
+		t.Run(stage, func(t *testing.T) {
+			t.Parallel()
+			failure := errors.New(stage + " failed")
+			provider := &fakeBootstrapper{run: func(context.Context) error {
+				if stage == "bootstrap" {
+					return failure
+				}
+				return nil
+			}}
+			runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
+				if stage == "config" {
+					return config.Effective{}, failure
+				}
+				return config.Effective{Account: "personal", StateDir: t.TempDir()}, nil
+			}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+				if stage == "authentication" {
+					return nil, failure
+				}
+				return provider, nil
+			}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+				if stage == "discovery" {
+					return discovery.Result{}, failure
+				}
+				return discovery.Result{TargetID: "target"}, nil
+			})
+			if _, err := runner.Plan(t.Context(), Request{Account: "personal"}); !errors.Is(err, failure) {
+				t.Fatalf("Plan() error = %v, want %v", err, failure)
+			}
+			if provider.mutationCalls() != 0 {
+				t.Fatalf("provider create/update/delete calls = %d, want zero", provider.mutationCalls())
+			}
+		})
+	}
+}
 
 func TestRunnerRestartLoadsAttemptBeforeCreateDecision(t *testing.T) {
 	t.Parallel()
@@ -259,6 +349,9 @@ func TestRunner_Run(t *testing.T) {
 			}
 			if !reflect.DeepEqual(order, tt.wantOrder) {
 				t.Fatalf("call order = %v, want %v", order, tt.wantOrder)
+			}
+			if provider.mutationCalls() != 0 {
+				t.Fatalf("provider mutations = %d, want zero", provider.mutationCalls())
 			}
 			if tt.wantErr == nil {
 				if result.Account != "personal" || result.Region != "eu-frankfurt-1" || result.TargetID != "target" || result.Decision != reconcile.DecisionCreate || result.Attempt == nil {

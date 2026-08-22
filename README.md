@@ -77,9 +77,12 @@ private keys or notification credentials.
 ```sh
 ocihood config validate --config ./config.yaml
 ocihood config show --config ./config.yaml --account personal
+ocihood plan --config ./config.yaml --account personal
 ocihood status --config ./config.yaml --account personal
 ```
 
+`plan` uses the same authentication and discovery path as `start`, then reports the resolved
+resources and reconciliation action without writing state, waiting for capacity, or mutating OCI.
 `status` reads the sole persisted target for the account without contacting OCI or mutating state.
 If multiple target states exist, it fails instead of choosing one.
 `start` performs discovery, loads this state under the target lock, runs the reconciliation

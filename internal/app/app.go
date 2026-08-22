@@ -41,6 +41,18 @@ type Result struct {
 	PublicIP           string
 }
 
+// Plan is the deterministic, read-only provisioning intent.
+type Plan struct {
+	Account, TargetID, Region, CompartmentID string
+	Shape, ImageID, VCNID, SubnetID          string
+	OCPUs, MemoryGB, BootVolumeGB            int
+	PublicIP                                 bool
+	AvailabilityDomains                      []string
+	Instances                                []reconcile.Instance
+	Action                                   reconcile.DecisionKind
+	Reason                                   string
+}
+
 // Error identifies the application phase that failed.
 type Error struct {
 	Phase string
@@ -95,69 +107,9 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 		return Result{}, &Error{Phase: "start", Err: err}
 	}
 	r.logger.InfoContext(ctx, "provisioning run started", "account", request.Account)
-
-	var effective config.Effective
-	var err error
-	if request.Configless {
-		effective, err = r.load(ctx, request.ConfigPath, request.Account)
-		if errors.Is(err, os.ErrNotExist) {
-			effective, err = config.Defaults(request.Account)
-		}
-	} else {
-		effective, err = r.load(ctx, request.ConfigPath, request.Account)
-	}
+	effective, provider, discovered, err := r.prepare(ctx, request)
 	if err != nil {
-		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "config")
-		return Result{}, &Error{Phase: "config", Err: err}
-	}
-	effective, err = config.ApplyOverrides(effective, request.Overrides)
-	if err != nil {
-		return Result{}, &Error{Phase: "config", Err: err}
-	}
-	if request.Configless {
-		if effective.CompartmentID == "" {
-			return Result{}, &Error{Phase: "config", Err: errors.New("--compartment-id is required without a configuration file")}
-		}
-		if effective.SSHPublicKeyPath == "" {
-			return Result{}, &Error{Phase: "config", Err: errors.New("--ssh-public-key is required without a configuration file")}
-		}
-		file, openErr := os.Open(effective.SSHPublicKeyPath)
-		if openErr != nil {
-			return Result{}, &Error{Phase: "config", Err: fmt.Errorf("open SSH public key: %w", openErr)}
-		}
-		if closeErr := file.Close(); closeErr != nil {
-			return Result{}, &Error{Phase: "config", Err: fmt.Errorf("close SSH public key: %w", closeErr)}
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return Result{}, &Error{Phase: "config", Err: err}
-	}
-	provider, err := r.authenticate(ctx, effective)
-	if err != nil {
-		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "authentication")
-		return Result{}, &Error{Phase: "authentication", Err: err}
-	}
-	if err := ctx.Err(); err != nil {
-		return Result{}, &Error{Phase: "authentication", Err: err}
-	}
-
-	run := provisioner.Run{
-		Account: request.Account, Settings: effective, Logger: r.logger, Bootstrapper: provider,
-	}
-	if err := run.Execute(ctx); err != nil {
-		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "bootstrap")
-		return Result{}, &Error{Phase: "bootstrap", Err: err}
-	}
-	if err := ctx.Err(); err != nil {
-		return Result{}, &Error{Phase: "bootstrap", Err: err}
-	}
-	discovered, err := r.discover(ctx, provider, effective)
-	if err != nil {
-		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "discovery")
-		return Result{}, &Error{Phase: "discovery", Err: err}
-	}
-	if err := ctx.Err(); err != nil {
-		return Result{}, &Error{Phase: "discovery", Err: err}
+		return Result{}, err
 	}
 	decision, err := reconcileAndPersist(effective, discovered, r.random, r.now().UTC())
 	if err != nil {
@@ -202,6 +154,91 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 
 	r.logger.InfoContext(ctx, "provisioning run completed", "account", request.Account, "region", effective.Region)
 	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain, InstanceID: instance.ID, InstanceState: instance.State, PublicIP: instance.PublicIP}, nil
+}
+
+// Plan performs the same bounded configuration, authentication, bootstrap, and discovery path as Run without writes.
+func (r *Runner) Plan(ctx context.Context, request Request) (Plan, error) {
+	if err := ctx.Err(); err != nil {
+		return Plan{}, &Error{Phase: "plan", Err: err}
+	}
+	effective, _, discovered, err := r.prepare(ctx, request)
+	if err != nil {
+		return Plan{}, err
+	}
+	value, err := state.New(effective.StateDir).Load(effective.Account, discovered.TargetID)
+	var local *reconcile.State
+	if err == nil {
+		local = value.ReconcileState()
+	} else if !errors.Is(err, state.ErrNotFound) {
+		return Plan{}, &Error{Phase: "state", Err: err}
+	}
+	decision := reconcile.Decide(reconcile.Input{TargetID: discovered.TargetID, Account: effective.Account, State: local, Instances: discovered.Instances, Now: r.now().UTC()})
+	managed := make([]reconcile.Instance, 0, len(discovered.Instances))
+	for _, instance := range discovered.Instances {
+		if reconcile.IsOwned(instance.Tags, discovered.TargetID, effective.Account) {
+			managed = append(managed, instance)
+		}
+	}
+	return Plan{
+		Account: effective.Account, TargetID: discovered.TargetID, Region: effective.Region, CompartmentID: discovered.CompartmentID,
+		Shape: effective.Shape, ImageID: discovered.Image.ID, VCNID: discovered.VCN.ID, SubnetID: discovered.Subnet.ID,
+		OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, BootVolumeGB: effective.BootVolumeGB, PublicIP: effective.PublicIP,
+		AvailabilityDomains: append([]string(nil), discovered.AvailabilityDomains...), Instances: managed,
+		Action: decision.Kind, Reason: decision.Reason,
+	}, nil
+}
+
+func (r *Runner) prepare(ctx context.Context, request Request) (config.Effective, provisioner.Bootstrapper, discovery.Result, error) {
+	effective, err := r.load(ctx, request.ConfigPath, request.Account)
+	if request.Configless && errors.Is(err, os.ErrNotExist) {
+		effective, err = config.Defaults(request.Account)
+	}
+	if err != nil {
+		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: err}
+	}
+	effective, err = config.ApplyOverrides(effective, request.Overrides)
+	if err != nil {
+		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: err}
+	}
+	if request.Configless {
+		if effective.CompartmentID == "" {
+			return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: errors.New("--compartment-id is required without a configuration file")}
+		}
+		if effective.SSHPublicKeyPath == "" {
+			return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: errors.New("--ssh-public-key is required without a configuration file")}
+		}
+		file, openErr := os.Open(effective.SSHPublicKeyPath)
+		if openErr != nil {
+			return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: fmt.Errorf("open SSH public key: %w", openErr)}
+		}
+		if closeErr := file.Close(); closeErr != nil {
+			return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: fmt.Errorf("close SSH public key: %w", closeErr)}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: err}
+	}
+	provider, err := r.authenticate(ctx, effective)
+	if err != nil {
+		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "authentication", Err: err}
+	}
+	if err := ctx.Err(); err != nil {
+		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "authentication", Err: err}
+	}
+	if err := (provisioner.Run{Account: request.Account, Settings: effective, Logger: r.logger, Bootstrapper: provider}).Execute(ctx); err != nil {
+		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "bootstrap", Err: err}
+	}
+	if err := ctx.Err(); err != nil {
+		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "bootstrap", Err: err}
+	}
+	discovered, err := r.discover(ctx, provider, effective)
+	if err != nil {
+		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "discovery", Err: err}
+	}
+	if err := ctx.Err(); err != nil {
+		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "discovery", Err: err}
+	}
+	return effective, provider, discovered, nil
 }
 
 func newAttemptAndPersist(effective config.Effective, targetID string, random io.Reader, now time.Time) (reconcile.Attempt, error) {
