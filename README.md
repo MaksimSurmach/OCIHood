@@ -32,6 +32,19 @@ accounts:
 Credential and SSH values are references only; OCIHood never copies their contents into
 project configuration or `config show` output.
 
+## Desired-resource identity and reconciliation
+
+`TargetID` is the SHA-256 digest of canonical JSON containing the normalized account and
+region, compartment/subnet/image identifiers, shape, OCPUs, memory, boot volume and public-IP
+intent. Strings are trimmed; account and region are lowercased. Runtime timestamps, retry
+counters, request IDs and launch attempts are excluded.
+
+Config supplies the target inputs. Durable state stores `TargetID`, the observed instance ID,
+and any in-flight `AttemptID`, OCI retry token and validity deadline. OCI free-form tags store
+`ocihood.managed=true`, `ocihood.target-id` and `ocihood.account`; all three must match before
+an instance is considered owned. Reconciliation compares durable state with owned provider
+observations and fails safe on incompatible state or multiple active matches.
+
 ```sh
 ocihood config validate --config ./config.yaml
 ocihood config show --config ./config.yaml --account personal
