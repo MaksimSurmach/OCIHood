@@ -88,6 +88,21 @@ If multiple target states exist, it fails instead of choosing one.
 `start` performs discovery, loads this state under the target lock, runs the reconciliation
 decision, and persists the resulting lifecycle before any future launch step may proceed.
 
+## Execution modes and output
+
+Normal `start` waits and retries until success or cancellation. `--once` probes each eligible
+availability domain at most once and returns `no_capacity` without sleeping or starting another
+cycle. `--max-runtime 10m` bounds either mode through context cancellation.
+
+`--output text|json` controls the final stdout result. JSON uses schema `ocihood.start/v1` and
+contains account, TargetID, outcome, region, instance identity/state/public IP, and a sanitized
+error category/message when applicable. `--log-format text|json` and
+`--log-level debug|info|warn|error` independently control diagnostics on stderr.
+
+Exit codes are stable: `0` success/already satisfied, `3` one-shot no capacity, `4` retryable
+provider failure, `1` fatal configuration/authentication/provider failure, `124` deadline, and
+`130` cancellation.
+
 ## Capacity watcher
 
 For create-safe decisions, `start` probes OCI Compute Capacity Report using the root tenancy,
@@ -125,7 +140,7 @@ The build and tests require no OCI credentials or external services.
 
 ## Logging
 
-OCIHood uses the standard library's `log/slog` package. Operational logs and diagnostics use the human-readable text handler and go to stderr. Command results go to stdout. Prefer structured fields such as `logger.Info("request complete", "region", region)` over formatted messages. Never log secrets, tokens, private keys, credentials or their contents.
+OCIHood uses the standard library's `log/slog` package. Operational logs and diagnostics go to stderr; final command results go to stdout. Prefer structured fields such as `logger.Info("request complete", "region", region)` over formatted messages. Never log secrets, tokens, private keys, credentials or their contents.
 
 ## License
 

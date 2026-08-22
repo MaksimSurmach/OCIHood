@@ -66,6 +66,7 @@ type Input struct {
 	AvailabilityDomains        []string
 	OCPUs, MemoryGB            int
 	Resume                     State
+	Once                       bool
 }
 
 type Result struct {
@@ -105,7 +106,8 @@ func (w Watcher) Watch(ctx context.Context, in Input) (Result, error) {
 	if state.NextAD < 0 || state.NextAD >= len(in.AvailabilityDomains) {
 		state.NextAD = 0
 	}
-	if !state.NextAttempt.IsZero() && state.NextAttempt.After(w.Now()) {
+	startAD := state.NextAD
+	if !in.Once && !state.NextAttempt.IsZero() && state.NextAttempt.After(w.Now()) {
 		if err := w.Sleeper.Sleep(ctx, state.NextAttempt.Sub(w.Now())); err != nil {
 			return Result{}, canceled(err)
 		}
@@ -149,6 +151,16 @@ func (w Watcher) Watch(ctx context.Context, in Input) (Result, error) {
 
 		state.LastAD, state.Status = ad, probe.Kind
 		state.NextAD = (state.NextAD + 1) % len(in.AvailabilityDomains)
+		if in.Once && state.NextAD == startAD {
+			state.NextAttempt = time.Time{}
+			if err := w.Store.Save(state); err != nil {
+				return Result{}, &Error{Kind: Fatal, AD: ad, Err: fmt.Errorf("persist watcher state: %w", err)}
+			}
+			return Result{Kind: Unavailable}, nil
+		}
+		if in.Once {
+			continue
+		}
 		if state.NextAD != 0 && probe.RetryAfter <= 0 {
 			continue
 		}

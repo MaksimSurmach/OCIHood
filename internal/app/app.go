@@ -25,6 +25,7 @@ type Request struct {
 	Account    string
 	Overrides  config.Overrides
 	Configless bool
+	Once       bool
 }
 
 // Result describes the completed read-only discovery and reconciliation decision.
@@ -72,7 +73,7 @@ type Authenticate func(context.Context, config.Effective) (provisioner.Bootstrap
 type Discover func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error)
 
 // WatchCapacity waits for advisory capacity after a create-safe reconciliation decision.
-type WatchCapacity func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error)
+type WatchCapacity func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, bool) (capacity.Result, error)
 
 // LaunchInstance executes the mutating and lifecycle portion after reconciliation.
 type LaunchInstance func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, reconcile.Decision, capacity.Result, string) (launch.Instance, error)
@@ -91,6 +92,12 @@ type Runner struct {
 
 // SetLaunch enables the production launch phase while preserving lightweight read-only runners in tests.
 func (r *Runner) SetLaunch(launchInstance LaunchInstance) { r.launchInstance = launchInstance }
+
+// SetLogger updates diagnostics for the next run.
+func (r *Runner) SetLogger(logger *slog.Logger) { r.logger = logger }
+
+// Logger returns the currently configured diagnostics logger.
+func (r *Runner) Logger() *slog.Logger { return r.logger }
 
 // NewRunner creates the application runner.
 func NewRunner(logger *slog.Logger, load Load, authenticate Authenticate, discover Discover, watchCapacity ...WatchCapacity) *Runner {
@@ -128,9 +135,12 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	}
 	for {
 		if r.watchCapacity != nil && createSafe {
-			capacityResult, err = r.watchCapacity(ctx, provider, effective, discovered)
+			capacityResult, err = r.watchCapacity(ctx, provider, effective, discovered, request.Once)
 			if err != nil {
 				return Result{}, &Error{Phase: "capacity", Err: err}
+			}
+			if request.Once && capacityResult.Kind == capacity.Unavailable {
+				break
 			}
 		}
 		if r.launchInstance == nil || (!createSafe && decision.InstanceID == "") {
@@ -139,6 +149,10 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 		instance, err = r.launchInstance(ctx, provider, effective, discovered, decision, capacityResult, string(sshKey))
 		var launchErr *launch.Error
 		if errors.As(err, &launchErr) && launchErr.Kind == launch.OutOfCapacity && createSafe {
+			if request.Once {
+				capacityResult = capacity.Result{Kind: capacity.Unavailable}
+				break
+			}
 			attempt, persistErr := newAttemptAndPersist(effective, discovered.TargetID, r.random, r.now().UTC())
 			if persistErr != nil {
 				return Result{}, &Error{Phase: "state", Err: persistErr}
@@ -153,7 +167,11 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	}
 
 	r.logger.InfoContext(ctx, "provisioning run completed", "account", request.Account, "region", effective.Region)
-	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain, InstanceID: instance.ID, InstanceState: instance.State, PublicIP: instance.PublicIP}, nil
+	instanceID := instance.ID
+	if instanceID == "" {
+		instanceID = decision.InstanceID
+	}
+	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain, InstanceID: instanceID, InstanceState: instance.State, PublicIP: instance.PublicIP}, nil
 }
 
 // Plan performs the same bounded configuration, authentication, bootstrap, and discovery path as Run without writes.
