@@ -72,6 +72,8 @@ ocihood status --config ./config.yaml --account personal
 
 `status` reads the sole persisted target for the account without contacting OCI or mutating state.
 If multiple target states exist, it fails instead of choosing one.
+`start` performs discovery, loads this state under the target lock, runs the reconciliation
+decision, and persists the resulting lifecycle before any future launch step may proceed.
 
 ## Development
 

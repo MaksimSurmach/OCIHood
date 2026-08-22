@@ -13,6 +13,7 @@ import (
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
+	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
 )
@@ -39,8 +40,10 @@ func TestStartCommandToProvisioner(t *testing.T) {
 		if path != "config.yaml" || account != "personal" {
 			t.Fatalf("load(%q, %q)", path, account)
 		}
-		return config.Effective{Account: account, Region: "eu-frankfurt-1"}, nil
-	}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil })
+		return config.Effective{Account: account, Region: "eu-frankfurt-1", StateDir: t.TempDir()}, nil
+	}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	})
 	var stdout, stderr bytes.Buffer
 
 	if code := Execute(t.Context(), []string{"--config", "config.yaml", "start", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {

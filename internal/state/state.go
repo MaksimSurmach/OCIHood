@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
@@ -72,6 +73,8 @@ type Locked struct {
 	account string
 	target  string
 	lock    *flock.Flock
+	mu      sync.Mutex
+	closed  bool
 }
 
 func (s *Store) TryLock(account, targetID string) (*Locked, error) {
@@ -97,9 +100,22 @@ func (s *Store) TryLock(account, targetID string) (*Locked, error) {
 	return &Locked{store: s, account: account, target: targetID, lock: lock}, nil
 }
 
-func (l *Locked) Close() error { return l.lock.Unlock() }
+func (l *Locked) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil
+	}
+	l.closed = true
+	return l.lock.Unlock()
+}
 
 func (l *Locked) Save(value State) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || !l.lock.Locked() {
+		return errors.New("state writer no longer owns the lock")
+	}
 	if value.Account != l.account || value.TargetID != l.target {
 		return errors.New("state identity does not match locked account and target")
 	}
@@ -233,6 +249,6 @@ func (s *Store) path(account, targetID string) (string, error) {
 }
 
 func accountKey(account string) string {
-	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(account))))
+	sum := sha256.Sum256([]byte(account))
 	return hex.EncodeToString(sum[:16])
 }

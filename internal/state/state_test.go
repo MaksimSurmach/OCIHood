@@ -130,6 +130,57 @@ func TestStoreLockingAndAtomicFailure(t *testing.T) {
 	}
 }
 
+func TestClosedWriterCannotSaveAfterLockTransfer(t *testing.T) {
+	t.Parallel()
+	store := New(t.TempDir())
+	first, err := store.TryLock("account", "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.TryLock("account", "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close() }()
+	value := State{Account: "account", TargetID: "target", Lifecycle: Waiting, UpdatedAt: time.Now().UTC()}
+	if err := first.Save(value); err == nil || !strings.Contains(err.Error(), "no longer owns") {
+		t.Fatalf("stale Save() error = %v", err)
+	}
+	if err := second.Save(value); err != nil {
+		t.Fatalf("current owner Save(): %v", err)
+	}
+}
+
+func TestAccountNamesDoNotAlias(t *testing.T) {
+	t.Parallel()
+	store := New(t.TempDir())
+	upper, err := store.TryLock("Prod", "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = upper.Close() }()
+	lower, err := store.TryLock("prod", "target")
+	if err != nil {
+		t.Fatalf("case-distinct account lock: %v", err)
+	}
+	defer func() { _ = lower.Close() }()
+	if err := upper.Save(State{Account: "Prod", TargetID: "target", Lifecycle: Waiting, UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lower.Save(State{Account: "prod", TargetID: "target", Lifecycle: Running, UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.Load("Prod", "target"); err != nil || got.Lifecycle != Waiting {
+		t.Fatalf("Load(Prod) = %+v, %v", got, err)
+	}
+	if got, err := store.Load("prod", "target"); err != nil || got.Lifecycle != Running {
+		t.Fatalf("Load(prod) = %+v, %v", got, err)
+	}
+}
+
 func TestReconcileStatePreservesRestartIdentity(t *testing.T) {
 	t.Parallel()
 	validTo := time.Now().Add(time.Hour)
