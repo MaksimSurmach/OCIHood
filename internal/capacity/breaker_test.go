@@ -3,6 +3,7 @@ package capacity
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -12,6 +13,34 @@ import (
 type breakerFakeClient struct {
 	results []ProbeResult
 	calls   int
+}
+
+func TestWatcherSharesBreakerAcrossADRotationAndOwnsBackoff(t *testing.T) {
+	now := time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)
+	provider := &fakeClient{
+		results: []ProbeResult{{Kind: Transient}, {Kind: Transient}},
+		errs:    []error{errors.New("503"), errors.New("503")},
+	}
+	circuit, err := breaker.New("capacity", breaker.Config{Failures: 2, HalfOpenRequests: 1, Interval: time.Minute, OpenTimeout: time.Minute}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	sleeper := &fakeSleeper{now: &now}
+	sleeper.after = func() {
+		if len(sleeper.durations) == 2 {
+			cancel()
+		}
+	}
+
+	_, err = newWatcher(BreakerClient{Client: provider, Circuit: circuit}, &fakeStore{}, sleeper, &now).Watch(ctx, input())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	gotADs := []string{provider.requests[0].AvailabilityDomain, provider.requests[1].AvailabilityDomain}
+	if !reflect.DeepEqual(gotADs, []string{"AD-1", "AD-2"}) || !reflect.DeepEqual(sleeper.durations, []time.Duration{time.Second, 2 * time.Second}) {
+		t.Fatalf("provider ADs=%v sleeps=%v", gotADs, sleeper.durations)
+	}
 }
 
 func (f *breakerFakeClient) Probe(context.Context, Request) (ProbeResult, error) {
