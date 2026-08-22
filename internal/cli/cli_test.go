@@ -9,10 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
+	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
+	"github.com/MaksimSurmach/OCIHood/internal/state"
 )
 
 type fakeRunner struct {
@@ -37,8 +40,10 @@ func TestStartCommandToProvisioner(t *testing.T) {
 		if path != "config.yaml" || account != "personal" {
 			t.Fatalf("load(%q, %q)", path, account)
 		}
-		return config.Effective{Account: account, Region: "eu-frankfurt-1"}, nil
-	}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil })
+		return config.Effective{Account: account, Region: "eu-frankfurt-1", StateDir: t.TempDir()}, nil
+	}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	})
 	var stdout, stderr bytes.Buffer
 
 	if code := Execute(t.Context(), []string{"--config", "config.yaml", "start", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {
@@ -77,6 +82,59 @@ func TestConfigCommands(t *testing.T) {
 			}
 			if runner.calls != 0 {
 				t.Fatalf("runner calls = %d, want 0", runner.calls)
+			}
+		})
+	}
+}
+
+func TestStatusCommandIsReadOnlyAndRendersLifecycles(t *testing.T) {
+	t.Parallel()
+	for _, lifecycle := range []state.Lifecycle{state.Discovered, state.Waiting, state.Provisioning, state.Running, state.Failed} {
+		t.Run(string(lifecycle), func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.yaml")
+			stateDir := filepath.Join(dir, "state")
+			contents := "defaults:\n  state_dir: " + stateDir + "\naccounts:\n  personal: {}\n"
+			if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store := state.New(stateDir)
+			locked, err := store.TryLock("personal", "target")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := locked.Save(state.State{Account: "personal", TargetID: "target", Lifecycle: lifecycle, UpdatedAt: time.Date(2026, 8, 22, 6, 30, 0, 0, time.UTC)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := locked.Close(); err != nil {
+				t.Fatal(err)
+			}
+			matches, err := filepath.Glob(filepath.Join(stateDir, "*", "target.json"))
+			if err != nil || len(matches) != 1 {
+				t.Fatalf("state file matches = %v, error = %v", matches, err)
+			}
+			before, err := os.Stat(matches[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner := &fakeRunner{}
+			var stdout, stderr bytes.Buffer
+			if code := Execute(t.Context(), []string{"--config", configPath, "status", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {
+				t.Fatalf("Execute() code = %d, stderr = %q", code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), "status: "+string(lifecycle)) || !strings.Contains(stdout.String(), "target_id: target") {
+				t.Fatalf("stdout = %q", stdout.String())
+			}
+			if runner.calls != 0 {
+				t.Fatalf("runner calls = %d, want zero provider/application calls", runner.calls)
+			}
+			after, err := os.Stat(matches[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !before.ModTime().Equal(after.ModTime()) {
+				t.Fatal("status mutated persisted state")
 			}
 		})
 	}

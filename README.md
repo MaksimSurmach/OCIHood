@@ -56,10 +56,24 @@ and any in-flight `AttemptID`, OCI retry token and validity deadline. OCI free-f
 an instance is considered owned. Reconciliation compares durable state with owned provider
 observations and fails safe on incompatible state or multiple active matches.
 
+## Durable state
+
+Each account/TargetID has one schema-versioned JSON state file under `state_dir`. Writes use
+an exclusive same-host lock, a restrictive temporary file, fsync and atomic rename. Missing,
+corrupt, truncated and unsupported-version state are distinct failures; none is interpreted as
+permission to create an instance. State contains lifecycle/progress identifiers only, never OCI
+private keys or notification credentials.
+
 ```sh
 ocihood config validate --config ./config.yaml
 ocihood config show --config ./config.yaml --account personal
+ocihood status --config ./config.yaml --account personal
 ```
+
+`status` reads the sole persisted target for the account without contacting OCI or mutating state.
+If multiple target states exist, it fails instead of choosing one.
+`start` performs discovery, loads this state under the target lock, runs the reconciliation
+decision, and persists the resulting lifecycle before any future launch step may proceed.
 
 ## Development
 

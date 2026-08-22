@@ -5,16 +5,63 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/config"
+	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
+	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
+	"github.com/MaksimSurmach/OCIHood/internal/state"
 )
 
 type fakeBootstrapper struct {
 	run func(context.Context) error
+}
+
+func TestRunnerRestartLoadsAttemptBeforeCreateDecision(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	effective := config.Effective{Account: "personal", Region: "eu-frankfurt-1", StateDir: root}
+	store := state.New(root)
+	now := time.Date(2026, 8, 22, 6, 30, 0, 0, time.UTC)
+	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
+	newProcess := func() *Runner {
+		runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
+			return effective, nil
+		}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+			return provider, nil
+		}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+			return discovery.Result{TargetID: "target"}, nil
+		})
+		runner.random = bytes.NewReader(make([]byte, 32))
+		runner.now = func() time.Time { return now }
+		return runner
+	}
+	first, err := newProcess().Run(t.Context(), Request{Account: "personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Decision != reconcile.DecisionCreate || first.Attempt == nil {
+		t.Fatalf("fresh decision = %+v, want create with durable attempt", first)
+	}
+	got, err := store.Load("personal", "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AttemptID != first.Attempt.ID || got.RetryToken != first.Attempt.RetryToken || got.Lifecycle != state.Provisioning {
+		t.Fatalf("persisted state = %+v, want returned attempt before handoff", got)
+	}
+	restarted, err := newProcess().Run(t.Context(), Request{Account: "personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Decision != reconcile.DecisionRetrySameAttempt || restarted.Attempt == nil || restarted.Attempt.ID != first.Attempt.ID {
+		t.Fatalf("restart decision = %+v, want retry original attempt", restarted)
+	}
 }
 
 func (f *fakeBootstrapper) Validate(ctx context.Context) error {
@@ -25,19 +72,22 @@ func TestRunner_Run(t *testing.T) {
 	errConfig := errors.New("unknown account")
 	errAuth := errors.New("bad credentials")
 	errProvider := errors.New("service unavailable")
+	errDiscovery := errors.New("discovery unavailable")
 	tests := []struct {
-		name        string
-		loadErr     error
-		authErr     error
-		providerErr error
-		wantErr     error
-		wantPhase   string
-		wantOrder   []string
+		name         string
+		loadErr      error
+		authErr      error
+		providerErr  error
+		discoveryErr error
+		wantErr      error
+		wantPhase    string
+		wantOrder    []string
 	}{
-		{name: "success", wantOrder: []string{"config", "auth", "bootstrap"}},
+		{name: "success", wantOrder: []string{"config", "auth", "bootstrap", "discovery"}},
 		{name: "config failure", loadErr: errConfig, wantErr: errConfig, wantPhase: "config", wantOrder: []string{"config"}},
 		{name: "auth failure", authErr: errAuth, wantErr: errAuth, wantPhase: "authentication", wantOrder: []string{"config", "auth"}},
 		{name: "provider failure", providerErr: errProvider, wantErr: errProvider, wantPhase: "bootstrap", wantOrder: []string{"config", "auth", "bootstrap"}},
+		{name: "discovery failure", discoveryErr: errDiscovery, wantErr: errDiscovery, wantPhase: "discovery", wantOrder: []string{"config", "auth", "bootstrap", "discovery"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -53,13 +103,16 @@ func TestRunner_Run(t *testing.T) {
 				if path != "config.yaml" || account != "personal" {
 					t.Fatalf("load(%q, %q)", path, account)
 				}
-				return config.Effective{Account: account, Region: "eu-frankfurt-1"}, tt.loadErr
+				return config.Effective{Account: account, Region: "eu-frankfurt-1", StateDir: filepath.Join(t.TempDir(), "state")}, tt.loadErr
 			}, func(_ context.Context, effective config.Effective) (provisioner.Bootstrapper, error) {
 				order = append(order, "auth")
 				if effective.Account != "personal" {
 					t.Fatalf("authenticate account = %q", effective.Account)
 				}
 				return provider, tt.authErr
+			}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+				order = append(order, "discovery")
+				return discovery.Result{TargetID: "target"}, tt.discoveryErr
 			})
 
 			result, err := runner.Run(t.Context(), Request{ConfigPath: "config.yaml", Account: "personal"})
@@ -76,7 +129,7 @@ func TestRunner_Run(t *testing.T) {
 				t.Fatalf("call order = %v, want %v", order, tt.wantOrder)
 			}
 			if tt.wantErr == nil {
-				if result != (Result{Account: "personal", Region: "eu-frankfurt-1"}) {
+				if result.Account != "personal" || result.Region != "eu-frankfurt-1" || result.TargetID != "target" || result.Decision != reconcile.DecisionCreate || result.Attempt == nil {
 					t.Errorf("result = %+v", result)
 				}
 				for _, message := range []string{"provisioning run started", "provider bootstrap started", "provider bootstrap completed", "provisioning run completed"} {
@@ -97,7 +150,7 @@ func TestRunner_RunCancellation(t *testing.T) {
 		runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
 			loadCalls++
 			return config.Effective{}, nil
-		}, nil)
+		}, nil, nil)
 		if _, err := runner.Run(ctx, Request{}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -118,7 +171,7 @@ func TestRunner_RunCancellation(t *testing.T) {
 		}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
 			authCalls++
 			return nil, nil
-		})
+		}, nil)
 		if _, err := runner.Run(ctx, Request{}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -139,7 +192,7 @@ func TestRunner_RunCancellation(t *testing.T) {
 				t.Fatal("authenticate received different context")
 			}
 			return provider, nil
-		})
+		}, nil)
 		if _, err := runner.Run(ctx, Request{}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -157,7 +210,7 @@ func TestRunner_RunCancellation(t *testing.T) {
 		}}
 		runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
 			return config.Effective{Account: "personal"}, nil
-		}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil })
+		}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, nil)
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan error)
 		go func() { _, err := runner.Run(ctx, Request{Account: "personal"}); done <- err }()

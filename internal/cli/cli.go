@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
+	"github.com/MaksimSurmach/OCIHood/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -65,8 +67,41 @@ func newRootCommand(runner Runner) *cobra.Command {
 	_ = start.MarkFlagRequired("account")
 	root.AddCommand(start)
 	root.AddCommand(newConfigCommand(&configPath))
+	root.AddCommand(newStatusCommand(&configPath))
 
 	return root
+}
+
+func newStatusCommand(configPath *string) *cobra.Command {
+	var account string
+	command := &cobra.Command{
+		Use: "status", Short: "Read persisted provisioning status without contacting OCI", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, err := config.Path(*configPath)
+			if err != nil {
+				return err
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				return err
+			}
+			effective, err := cfg.Resolve(account)
+			if err != nil {
+				return err
+			}
+			value, err := state.New(effective.StateDir).LoadAccount(account)
+			if err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "account: %s\ntarget_id: %s\nstatus: %s\ninstance_id: %s\npublic_ip: %s\nlast_result: %s\nlast_error: %s\nupdated_at: %s\n", value.Account, value.TargetID, value.Lifecycle, value.InstanceID, value.PublicIP, value.LastResult, value.LastError, value.UpdatedAt.Format(time.RFC3339)); err != nil {
+				return fmt.Errorf("write status: %w", err)
+			}
+			return nil
+		},
+	}
+	command.Flags().StringVar(&account, "account", "", "account name")
+	_ = command.MarkFlagRequired("account")
+	return command
 }
 
 func newConfigCommand(configPath *string) *cobra.Command {
