@@ -162,3 +162,42 @@ func TestMarshalEffectiveIsDeterministicAndDoesNotReadReferences(t *testing.T) {
 		t.Fatalf("unsafe or nondeterministic output: %q / %q", one, two)
 	}
 }
+
+func TestApplyOverridesPrecedenceAndExplicitValues(t *testing.T) {
+	t.Parallel()
+	stringValue := func(value string) *string { return &value }
+	intValue := func(value int) *int { return &value }
+	boolValue := func(value bool) *bool { return &value }
+	durationValue := func(value time.Duration) *time.Duration { return &value }
+
+	base := Effective{Account: "test", VCNName: "file-vcn", Shape: "file-shape", OCPUs: 4, MemoryGB: 8, BootVolumeGB: 50, PublicIP: true, RetryMin: time.Minute, RetryMax: 2 * time.Minute}
+	tests := []struct {
+		name      string
+		overrides Overrides
+		check     func(Effective) bool
+		wantErr   string
+	}{
+		{name: "unset preserves file", check: func(got Effective) bool { return reflect.DeepEqual(got, base) }},
+		{name: "all explicit values win", overrides: Overrides{Region: stringValue("eu-zurich-1"), Settings: Settings{Shape: stringValue("cli-shape"), OCPUs: intValue(2), PublicIP: boolValue(false), RetryMin: durationValue(30 * time.Second)}}, check: func(got Effective) bool {
+			return got.Region == "eu-zurich-1" && got.Shape == "cli-shape" && got.OCPUs == 2 && !got.PublicIP && got.RetryMin == 30*time.Second
+		}},
+		{name: "explicit zero is validated", overrides: Overrides{Settings: Settings{OCPUs: intValue(0)}}, wantErr: "ocpus must be greater than zero"},
+		{name: "exclusive selector replaces lower layer", overrides: Overrides{VCNID: stringValue("id")}, check: func(got Effective) bool { return got.VCNID == "id" && got.VCNName == "" }},
+		{name: "cross-field validation", overrides: Overrides{VCNID: stringValue("id"), VCNName: stringValue("name")}, wantErr: "mutually exclusive"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ApplyOverrides(base, tt.overrides)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || !tt.check(got) {
+				t.Fatalf("ApplyOverrides() = %#v, %v", got, err)
+			}
+		})
+	}
+}

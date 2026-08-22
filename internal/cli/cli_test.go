@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,134 @@ func TestStartCommandToProvisioner(t *testing.T) {
 	}
 	if provider.calls != 1 {
 		t.Fatalf("provider calls = %d, want 1", provider.calls)
+	}
+}
+
+func TestConfiglessFlagsReachSameEffectiveConfigAsFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	stateDir := filepath.Join(dir, "state")
+	publicKey := filepath.Join(dir, "id.pub")
+	if err := os.WriteFile(publicKey, []byte("ssh-ed25519 test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := "defaults:\n  state_dir: " + stateDir + "\naccounts:\n  personal:\n    oci_profile: TEST\n    region: eu-zurich-1\n    ssh_public_key_path: " + publicKey + "\n    compartment_id: compartment\n    image_id: image\n    subnet_id: subnet\n    overrides:\n      public_ip: false\n"
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var effective []config.Effective
+	provider := &integrationBootstrapper{}
+	runner := app.NewRunner(slog.Default(), func(_ context.Context, path, account string) (config.Effective, error) {
+		cfg, err := config.Load(path)
+		if err != nil {
+			return config.Effective{}, err
+		}
+		return cfg.Resolve(account)
+	}, func(_ context.Context, got config.Effective) (provisioner.Bootstrapper, error) {
+		effective = append(effective, got)
+		return provider, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	})
+
+	commands := [][]string{
+		{"--config", configPath, "start", "--account", "personal"},
+		{"start", "--account", "personal", "--oci-profile", "TEST", "--region", "eu-zurich-1", "--ssh-public-key", publicKey, "--compartment-id", "compartment", "--image-id", "image", "--subnet-id", "subnet", "--state-dir", stateDir, "--public-ip=false"},
+	}
+	for _, args := range commands {
+		var stdout, stderr bytes.Buffer
+		if code := Execute(t.Context(), args, runner, &stdout, &stderr); code != 0 {
+			t.Fatalf("Execute(%v) = %d, stderr %q", args, code, stderr.String())
+		}
+	}
+	if len(effective) != 2 || !reflect.DeepEqual(effective[0], effective[1]) {
+		t.Fatalf("effective configs differ: %#v / %#v", effective[0], effective[1])
+	}
+}
+
+func TestDefaultConfigReceivesCLIOverrides(t *testing.T) {
+	t.Parallel()
+	key := filepath.Join(t.TempDir(), "id.pub")
+	if err := os.WriteFile(key, []byte("ssh-ed25519 test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider := &integrationBootstrapper{}
+	runner := app.NewRunner(slog.Default(), func(_ context.Context, path, account string) (config.Effective, error) {
+		if path != "" || account != "personal" {
+			t.Fatalf("load(%q, %q)", path, account)
+		}
+		return config.Effective{Account: account, CompartmentID: "compartment", SSHPublicKeyPath: key, PublicIP: true, StateDir: t.TempDir()}, nil
+	}, func(_ context.Context, got config.Effective) (provisioner.Bootstrapper, error) {
+		if got.PublicIP {
+			t.Fatal("default config did not receive CLI override")
+		}
+		return provider, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	})
+	var stdout, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"start", "--account", "personal", "--public-ip=false"}, runner, &stdout, &stderr); code != 0 {
+		t.Fatalf("Execute() = %d, stderr = %q", code, stderr.String())
+	}
+}
+
+func TestConfiglessValidationAndHelp(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{}
+	var stdout, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"start", "--help"}, runner, &stdout, &stderr); code != 0 {
+		t.Fatal(stderr.String())
+	}
+	for _, want := range []string{"--public-ip", "--ssh-public-key", "Explicit flags override", "ocihood start --account"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("help missing %q: %s", want, stdout.String())
+		}
+	}
+}
+
+func TestConfigShowAcceptsConfiglessOverridesWithoutReadingReferences(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	key := filepath.Join(dir, "private-key")
+	secret := "SECRET-KEY-CONTENTS"
+	if err := os.WriteFile(key, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	args := []string{"config", "show", "--account", "personal", "--ssh-private-key", key, "--ssh-public-key", "/key.pub", "--public-ip=false"}
+	if code := Execute(t.Context(), args, &fakeRunner{}, &stdout, &stderr); code != 0 {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), secret) || !strings.Contains(stdout.String(), "public_ip: false") || !strings.Contains(stdout.String(), key) {
+		t.Fatalf("unsafe or incomplete output: %q", stdout.String())
+	}
+}
+
+func TestConfigShowDefaultFileReceivesCLIOverrides(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	path, err := config.DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := "defaults:\n  shape: file-shape\n  public_ip: true\naccounts:\n  personal:\n    oci_profile: FILE\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"config", "show", "--account", "personal", "--public-ip=false"}, &fakeRunner{}, &stdout, &stderr); code != 0 {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+	for _, want := range []string{"oci_profile: FILE", "shape: file-shape", "public_ip: false"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("output missing %q: %s", want, stdout.String())
+		}
 	}
 }
 

@@ -1,5 +1,15 @@
 # OCIHood
 
+`ocihood start` resolves configuration in this order: explicit CLI flags, account overrides, global project settings, then built-in defaults. `--config` selects a YAML file; without it, a run can be fully configured by flags and standard OCI credentials.
+
+```sh
+ocihood start --account personal --oci-profile DEFAULT \
+  --compartment-id ocid1.compartment... --image-id ocid1.image... \
+  --subnet-id ocid1.subnet... --ssh-public-key ~/.ssh/id_ed25519.pub
+```
+
+Use `ocihood start --help` for all operational flags. Credential and token contents are accepted only through referenced files/profiles, never raw secret flags.
+
 OCIHood is a command-line tool for provisioning Oracle Cloud Infrastructure resources.
 
 ## Configuration
