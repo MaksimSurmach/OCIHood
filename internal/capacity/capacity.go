@@ -115,9 +115,13 @@ func (w Watcher) Watch(ctx context.Context, in Input) (Result, error) {
 		ad := in.AvailabilityDomains[state.NextAD]
 		requestCtx, cancel := context.WithTimeout(ctx, w.Config.RequestTimeout)
 		probe, err := w.Client.Probe(requestCtx, Request{TenancyID: in.TenancyID, AvailabilityDomain: ad, Shape: in.Shape, OCPUs: in.OCPUs, MemoryGB: in.MemoryGB})
+		requestErr := requestCtx.Err()
 		cancel()
-		if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return Result{}, canceled(ctx.Err())
+		}
+		if errors.Is(requestErr, context.DeadlineExceeded) {
+			probe.Kind, err = Transient, requestErr
 		}
 		if err != nil && probe.Kind == "" {
 			probe.Kind = Transient

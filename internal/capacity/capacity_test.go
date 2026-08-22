@@ -150,6 +150,25 @@ func TestWatcherClassificationRestartAndCancellation(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+	t.Run("request timeout retries with backoff", func(t *testing.T) {
+		now := time.Now()
+		calls := 0
+		client := &fakeClient{call: func(ctx context.Context) (ProbeResult, error) {
+			calls++
+			if calls == 1 {
+				<-ctx.Done()
+				return ProbeResult{Kind: Canceled}, ctx.Err()
+			}
+			return ProbeResult{Kind: Available}, nil
+		}}
+		sleeper := &fakeSleeper{now: &now}
+		w := newWatcher(client, &fakeStore{}, sleeper, &now)
+		w.Config.RequestTimeout = 10 * time.Millisecond
+		got, err := w.Watch(t.Context(), Input{TargetID: "target", TenancyID: "root", Shape: "shape", AvailabilityDomains: []string{"AD"}, OCPUs: 1, MemoryGB: 1})
+		if err != nil || got.Kind != Available || calls != 2 || !reflect.DeepEqual(sleeper.durations, []time.Duration{time.Second}) {
+			t.Fatalf("result=%+v calls=%d sleeps=%v err=%v", got, calls, sleeper.durations, err)
+		}
+	})
 }
 
 func TestWatcherJitterRetryAfterAndQuietTransitions(t *testing.T) {
