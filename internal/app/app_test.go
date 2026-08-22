@@ -17,6 +17,7 @@ import (
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/launch"
+	"github.com/MaksimSurmach/OCIHood/internal/notification"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
@@ -25,6 +26,26 @@ import (
 type fakeBootstrapper struct {
 	run                                   func(context.Context) error
 	createCalls, updateCalls, deleteCalls int
+}
+
+type fakeNotifier struct {
+	events []notification.Event
+	err    error
+}
+
+func TestNotificationFailureIsMetadataOnly(t *testing.T) {
+	var logs bytes.Buffer
+	runner := &Runner{logger: slog.New(slog.NewTextHandler(&logs, nil)), notifier: &fakeNotifier{err: errors.New("network failed")}}
+	result := Result{}
+	runner.notify(t.Context(), &result, notification.Event{Kind: notification.RunStarted})
+	if len(result.NotificationErrors) != 1 || !strings.Contains(logs.String(), "notification failed") {
+		t.Fatalf("result=%+v logs=%q", result, logs.String())
+	}
+}
+
+func (f *fakeNotifier) Notify(_ context.Context, event notification.Event) error {
+	f.events = append(f.events, event)
+	return f.err
 }
 
 func (f *fakeBootstrapper) Create() { f.createCalls++ }
@@ -342,12 +363,23 @@ func TestRunnerFullProvisioningFlow(t *testing.T) {
 		}
 		return launch.Instance{ID: "instance", State: "RUNNING", PublicIP: "203.0.113.1"}, nil
 	})
+	notifier := &fakeNotifier{}
+	runner.SetNotifier(notifier)
 	got, err := runner.Run(t.Context(), Request{Account: "personal"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.InstanceID != "instance" || got.InstanceState != "RUNNING" || got.PublicIP != "203.0.113.1" {
 		t.Fatalf("result=%+v", got)
+	}
+	want := []notification.Kind{notification.RunStarted, notification.Waiting, notification.CapacityFound, notification.InstanceRunning}
+	if len(notifier.events) != len(want) {
+		t.Fatalf("events=%+v", notifier.events)
+	}
+	for i := range want {
+		if notifier.events[i].Kind != want[i] {
+			t.Fatalf("events=%+v", notifier.events)
+		}
 	}
 }
 

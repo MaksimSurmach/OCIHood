@@ -15,6 +15,7 @@ import (
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/launch"
+	"github.com/MaksimSurmach/OCIHood/internal/notification"
 	"github.com/MaksimSurmach/OCIHood/internal/provider/oci/auth"
 	ocicapacity "github.com/MaksimSurmach/OCIHood/internal/provider/oci/capacity"
 	ocidiscovery "github.com/MaksimSurmach/OCIHood/internal/provider/oci/discovery"
@@ -84,6 +85,12 @@ func main() {
 			Request:            launch.Request{TargetID: discovered.TargetID, Account: effective.Account, CompartmentID: discovered.CompartmentID, AvailabilityDomain: placement.AvailabilityDomain, Shape: effective.Shape, ImageID: discovered.Image.ID, SubnetID: discovered.Subnet.ID, SSHPublicKey: sshKey, OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, BootVolumeGB: effective.BootVolumeGB, PublicIP: effective.PublicIP, Attempt: *attempt},
 			ExistingInstanceID: decision.InstanceID, RequestTimeout: effective.RequestTimeout, RetryMin: effective.RetryMin, RetryMax: effective.RetryMax,
 		})
+	})
+	runner.SetNotifierFactory(func(effective config.Effective) notification.Notifier {
+		if !effective.Notifications.Enabled {
+			return nil
+		}
+		return notification.Telegram{Token: os.Getenv(effective.Notifications.TelegramTokenEnv), ChatID: effective.Notifications.TelegramChat, Timeout: effective.RequestTimeout}
 	})
 	exitCode := cli.Execute(ctx, os.Args[1:], runner, os.Stdout, os.Stderr)
 	stop()

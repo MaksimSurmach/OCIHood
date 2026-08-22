@@ -15,6 +15,7 @@ import (
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/launch"
+	"github.com/MaksimSurmach/OCIHood/internal/notification"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
@@ -42,6 +43,7 @@ type Result struct {
 	InstanceState      string
 	PublicIP           string
 	Policy             config.PolicyDecision
+	NotificationErrors []string
 }
 
 // Plan is the deterministic, read-only provisioning intent.
@@ -83,14 +85,31 @@ type LaunchInstance func(context.Context, provisioner.Bootstrapper, config.Effec
 
 // Runner coordinates configuration, authentication, and provisioning.
 type Runner struct {
-	logger         *slog.Logger
-	load           Load
-	authenticate   Authenticate
-	discover       Discover
-	watchCapacity  WatchCapacity
-	launchInstance LaunchInstance
-	random         io.Reader
-	now            func() time.Time
+	logger          *slog.Logger
+	load            Load
+	authenticate    Authenticate
+	discover        Discover
+	watchCapacity   WatchCapacity
+	launchInstance  LaunchInstance
+	random          io.Reader
+	now             func() time.Time
+	notifier        notification.Notifier
+	notifierFactory func(config.Effective) notification.Notifier
+}
+
+func (r *Runner) SetNotifier(notifier notification.Notifier) { r.notifier = notifier }
+func (r *Runner) SetNotifierFactory(factory func(config.Effective) notification.Notifier) {
+	r.notifierFactory = factory
+}
+
+func (r *Runner) notify(ctx context.Context, result *Result, event notification.Event) {
+	if r.notifier == nil {
+		return
+	}
+	if err := r.notifier.Notify(ctx, event); err != nil {
+		result.NotificationErrors = append(result.NotificationErrors, err.Error())
+		r.logger.WarnContext(ctx, "notification failed", "kind", event.Kind, "error", err)
+	}
 }
 
 // SetLaunch enables the production launch phase while preserving lightweight read-only runners in tests.
@@ -122,8 +141,16 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 		return Result{}, err
 	}
 	policy := config.EvaluatePolicy(effective)
+	if r.notifierFactory != nil {
+		r.notifier = r.notifierFactory(effective)
+	}
 	baseResult := Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Policy: policy}
+	event := func(kind notification.Kind, detail string) notification.Event {
+		return notification.Event{Kind: kind, Account: effective.Account, Region: effective.Region, TargetID: discovered.TargetID, Detail: detail}
+	}
+	r.notify(ctx, &baseResult, event(notification.RunStarted, ""))
 	if !policy.Allowed {
+		r.notify(ctx, &baseResult, event(notification.TerminalFailure, "resource policy rejected"))
 		return baseResult, &Error{Phase: "policy", Err: fmt.Errorf("resource policy rejected: %s", strings.Join(policy.Violations, "; "))}
 	}
 	if r.launchInstance != nil {
@@ -145,18 +172,22 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if r.launchInstance != nil && createSafe {
 		sshKey, err = os.ReadFile(effective.SSHPublicKeyPath)
 		if err != nil {
-			return Result{}, &Error{Phase: "launch", Err: fmt.Errorf("read SSH public key: %w", err)}
+			r.notify(ctx, &baseResult, event(notification.TerminalFailure, "SSH public key is unreadable"))
+			return baseResult, &Error{Phase: "launch", Err: fmt.Errorf("read SSH public key: %w", err)}
 		}
 	}
 	for {
 		if r.watchCapacity != nil && createSafe {
+			r.notify(ctx, &baseResult, event(notification.Waiting, "capacity check started"))
 			capacityResult, err = r.watchCapacity(ctx, provider, effective, discovered, request.Once)
 			if err != nil {
-				return Result{}, &Error{Phase: "capacity", Err: err}
+				r.notify(ctx, &baseResult, event(notification.TerminalFailure, "capacity check failed"))
+				return baseResult, &Error{Phase: "capacity", Err: err}
 			}
 			if request.Once && capacityResult.Kind == capacity.Unavailable {
 				break
 			}
+			r.notify(ctx, &baseResult, event(notification.CapacityFound, capacityResult.AvailabilityDomain))
 		}
 		if r.launchInstance == nil || (!createSafe && decision.InstanceID == "") {
 			break
@@ -164,6 +195,7 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 		instance, err = r.launchInstance(ctx, provider, effective, discovered, decision, capacityResult, string(sshKey))
 		var launchErr *launch.Error
 		if errors.As(err, &launchErr) && launchErr.Kind == launch.OutOfCapacity && createSafe {
+			r.notify(ctx, &baseResult, event(notification.Degraded, "capacity changed before launch"))
 			if request.Once {
 				capacityResult = capacity.Result{Kind: capacity.Unavailable}
 				break
@@ -176,7 +208,8 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 			continue
 		}
 		if err != nil {
-			return Result{}, &Error{Phase: "launch", Err: err}
+			r.notify(ctx, &baseResult, event(notification.TerminalFailure, "instance launch failed"))
+			return baseResult, &Error{Phase: "launch", Err: err}
 		}
 		break
 	}
@@ -189,6 +222,9 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	baseResult.Decision, baseResult.Attempt = decision.Kind, decision.Attempt
 	baseResult.Capacity, baseResult.AvailabilityDomain = capacityResult.Kind, capacityResult.AvailabilityDomain
 	baseResult.InstanceID, baseResult.InstanceState, baseResult.PublicIP = instanceID, instance.State, instance.PublicIP
+	if instanceID != "" {
+		r.notify(ctx, &baseResult, notification.Event{Kind: notification.InstanceRunning, Account: effective.Account, Region: effective.Region, TargetID: discovered.TargetID, InstanceID: instanceID, PublicIP: instance.PublicIP})
+	}
 	return baseResult, nil
 }
 
