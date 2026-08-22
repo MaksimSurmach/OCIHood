@@ -28,21 +28,36 @@ type fakeBootstrapper struct {
 
 func TestConfiglessMissingRequiredInputStopsBeforeProvider(t *testing.T) {
 	t.Parallel()
-	providerCalls := 0
-	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
-		t.Fatal("configless run must not load a file")
-		return config.Effective{}, nil
-	}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
-		providerCalls++
-		return &fakeBootstrapper{}, nil
-	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
-		return discovery.Result{}, nil
-	})
-	_, err := runner.Run(t.Context(), Request{Account: "personal", Configless: true})
-	if err == nil || !strings.Contains(err.Error(), "--ssh-public-key is required") || providerCalls != 0 {
-		t.Fatalf("Run() error = %v, provider calls = %d", err, providerCalls)
+	missingKey := filepath.Join(t.TempDir(), "missing.pub")
+	tests := []struct {
+		name      string
+		overrides config.Overrides
+		want      string
+	}{
+		{name: "compartment", want: "--compartment-id is required"},
+		{name: "key reference", overrides: config.Overrides{CompartmentID: pointer("compartment")}, want: "--ssh-public-key is required"},
+		{name: "readable key", overrides: config.Overrides{CompartmentID: pointer("compartment"), SSHPublicKeyPath: &missingKey}, want: "open SSH public key"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			providerCalls := 0
+			runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
+				return config.Effective{}, os.ErrNotExist
+			}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+				providerCalls++
+				return &fakeBootstrapper{}, nil
+			}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+				return discovery.Result{}, nil
+			})
+			_, err := runner.Run(t.Context(), Request{Account: "personal", Configless: true, Overrides: tt.overrides})
+			if err == nil || !strings.Contains(err.Error(), tt.want) || providerCalls != 0 {
+				t.Fatalf("Run() error = %v, provider calls = %d", err, providerCalls)
+			}
+		})
 	}
 }
+
+func pointer(value string) *string { return &value }
 
 func TestRunnerRestartLoadsAttemptBeforeCreateDecision(t *testing.T) {
 	t.Parallel()

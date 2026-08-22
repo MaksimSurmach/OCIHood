@@ -99,7 +99,10 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	var effective config.Effective
 	var err error
 	if request.Configless {
-		effective, err = config.Defaults(request.Account)
+		effective, err = r.load(ctx, request.ConfigPath, request.Account)
+		if errors.Is(err, os.ErrNotExist) {
+			effective, err = config.Defaults(request.Account)
+		}
 	} else {
 		effective, err = r.load(ctx, request.ConfigPath, request.Account)
 	}
@@ -111,8 +114,20 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, &Error{Phase: "config", Err: err}
 	}
-	if request.Configless && effective.SSHPublicKeyPath == "" {
-		return Result{}, &Error{Phase: "config", Err: errors.New("--ssh-public-key is required without a configuration file")}
+	if request.Configless {
+		if effective.CompartmentID == "" {
+			return Result{}, &Error{Phase: "config", Err: errors.New("--compartment-id is required without a configuration file")}
+		}
+		if effective.SSHPublicKeyPath == "" {
+			return Result{}, &Error{Phase: "config", Err: errors.New("--ssh-public-key is required without a configuration file")}
+		}
+		file, openErr := os.Open(effective.SSHPublicKeyPath)
+		if openErr != nil {
+			return Result{}, &Error{Phase: "config", Err: fmt.Errorf("open SSH public key: %w", openErr)}
+		}
+		if closeErr := file.Close(); closeErr != nil {
+			return Result{}, &Error{Phase: "config", Err: fmt.Errorf("close SSH public key: %w", closeErr)}
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return Result{}, &Error{Phase: "config", Err: err}

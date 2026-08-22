@@ -60,7 +60,11 @@ func TestConfiglessFlagsReachSameEffectiveConfigAsFile(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	stateDir := filepath.Join(dir, "state")
-	body := "defaults:\n  state_dir: " + stateDir + "\naccounts:\n  personal:\n    oci_profile: TEST\n    region: eu-zurich-1\n    ssh_public_key_path: /keys/test.pub\n    compartment_id: compartment\n    image_id: image\n    subnet_id: subnet\n    overrides:\n      public_ip: false\n"
+	publicKey := filepath.Join(dir, "id.pub")
+	if err := os.WriteFile(publicKey, []byte("ssh-ed25519 test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := "defaults:\n  state_dir: " + stateDir + "\naccounts:\n  personal:\n    oci_profile: TEST\n    region: eu-zurich-1\n    ssh_public_key_path: " + publicKey + "\n    compartment_id: compartment\n    image_id: image\n    subnet_id: subnet\n    overrides:\n      public_ip: false\n"
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +85,7 @@ func TestConfiglessFlagsReachSameEffectiveConfigAsFile(t *testing.T) {
 
 	commands := [][]string{
 		{"--config", configPath, "start", "--account", "personal"},
-		{"start", "--account", "personal", "--oci-profile", "TEST", "--region", "eu-zurich-1", "--ssh-public-key", "/keys/test.pub", "--compartment-id", "compartment", "--image-id", "image", "--subnet-id", "subnet", "--state-dir", stateDir, "--public-ip=false"},
+		{"start", "--account", "personal", "--oci-profile", "TEST", "--region", "eu-zurich-1", "--ssh-public-key", publicKey, "--compartment-id", "compartment", "--image-id", "image", "--subnet-id", "subnet", "--state-dir", stateDir, "--public-ip=false"},
 	}
 	for _, args := range commands {
 		var stdout, stderr bytes.Buffer
@@ -91,6 +95,32 @@ func TestConfiglessFlagsReachSameEffectiveConfigAsFile(t *testing.T) {
 	}
 	if len(effective) != 2 || !reflect.DeepEqual(effective[0], effective[1]) {
 		t.Fatalf("effective configs differ: %#v / %#v", effective[0], effective[1])
+	}
+}
+
+func TestDefaultConfigReceivesCLIOverrides(t *testing.T) {
+	t.Parallel()
+	key := filepath.Join(t.TempDir(), "id.pub")
+	if err := os.WriteFile(key, []byte("ssh-ed25519 test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider := &integrationBootstrapper{}
+	runner := app.NewRunner(slog.Default(), func(_ context.Context, path, account string) (config.Effective, error) {
+		if path != "" || account != "personal" {
+			t.Fatalf("load(%q, %q)", path, account)
+		}
+		return config.Effective{Account: account, CompartmentID: "compartment", SSHPublicKeyPath: key, PublicIP: true, StateDir: t.TempDir()}, nil
+	}, func(_ context.Context, got config.Effective) (provisioner.Bootstrapper, error) {
+		if got.PublicIP {
+			t.Fatal("default config did not receive CLI override")
+		}
+		return provider, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	})
+	var stdout, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"start", "--account", "personal", "--public-ip=false"}, runner, &stdout, &stderr); code != 0 {
+		t.Fatalf("Execute() = %d, stderr = %q", code, stderr.String())
 	}
 }
 
