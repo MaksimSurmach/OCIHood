@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -111,6 +112,42 @@ func TestWatcherOnceProbesEachADExactlyOnceWithoutSleeping(t *testing.T) {
 	if len(client.requests) != len(once.AvailabilityDomains) || len(sleeper.durations) != 0 {
 		t.Fatalf("requests=%d sleeps=%v", len(client.requests), sleeper.durations)
 	}
+}
+
+func TestWatcherOnceResumesOneRotationWithoutPersistedSleep(t *testing.T) {
+	now := time.Date(2026, 8, 22, 7, 0, 0, 0, time.UTC)
+	client := &fakeClient{results: []ProbeResult{{Kind: Unavailable}, {Kind: Throttled, RetryAfter: time.Hour}}, errs: []error{nil, errors.New("429")}}
+	sleeper := &fakeSleeper{now: &now}
+	once := input()
+	once.Once = true
+	once.Resume = State{NextAD: 1, NextAttempt: now.Add(time.Hour), RetryCount: 3}
+
+	got, err := newWatcher(client, &fakeStore{}, sleeper, &now).Watch(t.Context(), once)
+	if err != nil || got.Kind != Unavailable {
+		t.Fatalf("result=%+v err=%v", got, err)
+	}
+	gotADs := []string{client.requests[0].AvailabilityDomain, client.requests[1].AvailabilityDomain}
+	if !reflect.DeepEqual(gotADs, []string{"AD-2", "AD-1"}) || len(sleeper.durations) != 0 {
+		t.Fatalf("ADs=%v sleeps=%v", gotADs, sleeper.durations)
+	}
+}
+
+func TestWatcherDeadlineDuringRequestRetrySleep(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Now
+		client := &fakeClient{call: func(ctx context.Context) (ProbeResult, error) {
+			<-ctx.Done()
+			return ProbeResult{Kind: Canceled}, ctx.Err()
+		}}
+		w := Watcher{Client: client, Store: &fakeStore{}, Sleeper: TimerSleeper{}, Random: fixedRandom(.5), Now: now, Config: Config{RequestTimeout: time.Second, InitialInterval: time.Second, MaxInterval: time.Second}}
+		ctx, cancel := context.WithTimeout(t.Context(), 1500*time.Millisecond)
+		defer cancel()
+
+		_, err := w.Watch(ctx, Input{TargetID: "target", TenancyID: "root", Shape: "shape", AvailabilityDomains: []string{"AD"}, OCPUs: 1, MemoryGB: 1})
+		if !errors.Is(err, context.DeadlineExceeded) || len(client.requests) != 1 {
+			t.Fatalf("requests=%d err=%v", len(client.requests), err)
+		}
+	})
 }
 
 func TestWatcherClassificationRestartAndCancellation(t *testing.T) {

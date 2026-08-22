@@ -167,7 +167,11 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	}
 
 	r.logger.InfoContext(ctx, "provisioning run completed", "account", request.Account, "region", effective.Region)
-	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain, InstanceID: instance.ID, InstanceState: instance.State, PublicIP: instance.PublicIP}, nil
+	instanceID := instance.ID
+	if instanceID == "" {
+		instanceID = decision.InstanceID
+	}
+	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain, InstanceID: instanceID, InstanceState: instance.State, PublicIP: instance.PublicIP}, nil
 }
 
 // Plan performs the same bounded configuration, authentication, bootstrap, and discovery path as Run without writes.

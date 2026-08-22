@@ -410,6 +410,42 @@ func TestStartExecutionModesAndOutput(t *testing.T) {
 		}
 	})
 
+	t.Run("log and result formats are independent", func(t *testing.T) {
+		for _, tt := range []struct {
+			name, output, logFormat string
+		}{
+			{name: "text text", output: "text", logFormat: "text"},
+			{name: "text json", output: "text", logFormat: "json"},
+			{name: "json text", output: "json", logFormat: "text"},
+			{name: "json json", output: "json", logFormat: "json"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				runner := &loggingRunner{result: app.Result{Account: "personal", Decision: reconcile.DecisionAlreadySatisfied, InstanceID: "instance-existing"}}
+				var stdout, stderr bytes.Buffer
+				args := []string{"start", "--account", "personal", "--log-level=debug", "--output=" + tt.output, "--log-format=" + tt.logFormat}
+				if code := Execute(t.Context(), args, runner, &stdout, &stderr); code != 0 {
+					t.Fatalf("code=%d stderr=%q", code, stderr.String())
+				}
+				if tt.output == "json" {
+					var result commandDocument
+					if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || result.Outcome != "already_satisfied" || result.InstanceID != "instance-existing" {
+						t.Fatalf("result=%+v err=%v stdout=%q", result, err, stdout.String())
+					}
+				} else if !strings.Contains(stdout.String(), "already_satisfied") || !strings.Contains(stdout.String(), "instance-existing") {
+					t.Fatalf("stdout=%q", stdout.String())
+				}
+				if tt.logFormat == "json" {
+					var diagnostic map[string]any
+					if err := json.Unmarshal(stderr.Bytes(), &diagnostic); err != nil {
+						t.Fatalf("stderr is not JSON: %v: %q", err, stderr.String())
+					}
+				} else if !strings.Contains(stderr.String(), "msg=diagnostic") {
+					t.Fatalf("stderr=%q", stderr.String())
+				}
+			})
+		}
+	})
+
 	t.Run("max runtime returns deadline result", func(t *testing.T) {
 		runner := &fakeRunner{run: func(ctx context.Context, _ app.Request) (app.Result, error) {
 			<-ctx.Done()

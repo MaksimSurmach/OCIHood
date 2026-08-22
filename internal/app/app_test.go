@@ -111,6 +111,22 @@ func TestPlanIsDeterministicAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestRunAlreadySatisfiedPreservesInstanceID(t *testing.T) {
+	t.Parallel()
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir()}
+	targetID := "target"
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+		return &fakeBootstrapper{run: func(context.Context) error { return nil }}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: targetID, Instances: []reconcile.Instance{{ID: "instance-existing", Lifecycle: reconcile.LifecycleActive, Tags: reconcile.OwnershipTags(targetID, "personal")}}}, nil
+	})
+
+	got, err := runner.Run(t.Context(), Request{Account: "personal", Once: true})
+	if err != nil || got.Decision != reconcile.DecisionAlreadySatisfied || got.InstanceID != "instance-existing" {
+		t.Fatalf("result=%+v err=%v", got, err)
+	}
+}
+
 func TestPlanFailuresNeverMutateProvider(t *testing.T) {
 	t.Parallel()
 	for _, stage := range []string{"config", "authentication", "bootstrap", "discovery"} {
