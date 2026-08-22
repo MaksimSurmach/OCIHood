@@ -31,12 +31,13 @@ func TestRunner_Run(t *testing.T) {
 		authErr     error
 		providerErr error
 		wantErr     error
+		wantPhase   string
 		wantOrder   []string
 	}{
 		{name: "success", wantOrder: []string{"config", "auth", "bootstrap"}},
-		{name: "config failure", loadErr: errConfig, wantErr: errConfig, wantOrder: []string{"config"}},
-		{name: "auth failure", authErr: errAuth, wantErr: errAuth, wantOrder: []string{"config", "auth"}},
-		{name: "provider failure", providerErr: errProvider, wantErr: errProvider, wantOrder: []string{"config", "auth", "bootstrap"}},
+		{name: "config failure", loadErr: errConfig, wantErr: errConfig, wantPhase: "config", wantOrder: []string{"config"}},
+		{name: "auth failure", authErr: errAuth, wantErr: errAuth, wantPhase: "authentication", wantOrder: []string{"config", "auth"}},
+		{name: "provider failure", providerErr: errProvider, wantErr: errProvider, wantPhase: "bootstrap", wantOrder: []string{"config", "auth", "bootstrap"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -47,13 +48,13 @@ func TestRunner_Run(t *testing.T) {
 				return tt.providerErr
 			}}
 			var logs bytes.Buffer
-			runner := NewRunner(slog.New(slog.NewTextHandler(&logs, nil)), func(path, account string) (config.Effective, error) {
+			runner := NewRunner(slog.New(slog.NewTextHandler(&logs, nil)), func(_ context.Context, path, account string) (config.Effective, error) {
 				order = append(order, "config")
 				if path != "config.yaml" || account != "personal" {
 					t.Fatalf("load(%q, %q)", path, account)
 				}
 				return config.Effective{Account: account, Region: "eu-frankfurt-1"}, tt.loadErr
-			}, func(effective config.Effective) (provisioner.Bootstrapper, error) {
+			}, func(_ context.Context, effective config.Effective) (provisioner.Bootstrapper, error) {
 				order = append(order, "auth")
 				if effective.Account != "personal" {
 					t.Fatalf("authenticate account = %q", effective.Account)
@@ -64,6 +65,12 @@ func TestRunner_Run(t *testing.T) {
 			result, err := runner.Run(t.Context(), Request{ConfigPath: "config.yaml", Account: "personal"})
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("Run() error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr != nil {
+				var appErr *Error
+				if !errors.As(err, &appErr) || appErr.Phase != tt.wantPhase {
+					t.Fatalf("Run() error = %#v, want app phase %q", err, tt.wantPhase)
+				}
 			}
 			if !reflect.DeepEqual(order, tt.wantOrder) {
 				t.Fatalf("call order = %v, want %v", order, tt.wantOrder)
@@ -87,7 +94,7 @@ func TestRunner_RunCancellation(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		loadCalls := 0
-		runner := NewRunner(slog.Default(), func(string, string) (config.Effective, error) {
+		runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
 			loadCalls++
 			return config.Effective{}, nil
 		}, nil)
@@ -99,6 +106,48 @@ func TestRunner_RunCancellation(t *testing.T) {
 		}
 	})
 
+	t.Run("during config", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		authCalls := 0
+		runner := NewRunner(slog.Default(), func(loadCtx context.Context, _, _ string) (config.Effective, error) {
+			cancel()
+			if loadCtx != ctx {
+				t.Fatal("load received different context")
+			}
+			return config.Effective{}, nil
+		}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+			authCalls++
+			return nil, nil
+		})
+		if _, err := runner.Run(ctx, Request{}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if authCalls != 0 {
+			t.Fatalf("auth calls = %d", authCalls)
+		}
+	})
+
+	t.Run("during authentication", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		providerCalls := 0
+		provider := &fakeBootstrapper{run: func(context.Context) error { providerCalls++; return nil }}
+		runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
+			return config.Effective{}, nil
+		}, func(authCtx context.Context, _ config.Effective) (provisioner.Bootstrapper, error) {
+			cancel()
+			if authCtx != ctx {
+				t.Fatal("authenticate received different context")
+			}
+			return provider, nil
+		})
+		if _, err := runner.Run(ctx, Request{}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if providerCalls != 0 {
+			t.Fatalf("provider calls = %d", providerCalls)
+		}
+	})
+
 	t.Run("during provider call", func(t *testing.T) {
 		started := make(chan struct{})
 		provider := &fakeBootstrapper{run: func(ctx context.Context) error {
@@ -106,9 +155,9 @@ func TestRunner_RunCancellation(t *testing.T) {
 			<-ctx.Done()
 			return ctx.Err()
 		}}
-		runner := NewRunner(slog.Default(), func(string, string) (config.Effective, error) {
+		runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
 			return config.Effective{Account: "personal"}, nil
-		}, func(config.Effective) (provisioner.Bootstrapper, error) { return provider, nil })
+		}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil })
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan error)
 		go func() { _, err := runner.Run(ctx, Request{Account: "personal"}); done <- err }()

@@ -33,12 +33,12 @@ func (f *integrationBootstrapper) Validate(context.Context) error {
 func TestStartCommandToProvisioner(t *testing.T) {
 	t.Parallel()
 	provider := &integrationBootstrapper{}
-	runner := app.NewRunner(slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), func(path, account string) (config.Effective, error) {
+	runner := app.NewRunner(slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), func(_ context.Context, path, account string) (config.Effective, error) {
 		if path != "config.yaml" || account != "personal" {
 			t.Fatalf("load(%q, %q)", path, account)
 		}
 		return config.Effective{Account: account, Region: "eu-frankfurt-1"}, nil
-	}, func(config.Effective) (provisioner.Bootstrapper, error) { return provider, nil })
+	}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil })
 	var stdout, stderr bytes.Buffer
 
 	if code := Execute(t.Context(), []string{"--config", "config.yaml", "start", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {

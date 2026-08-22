@@ -17,7 +17,7 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	runner := app.NewRunner(logger, func(path, account string) (config.Effective, error) {
+	runner := app.NewRunner(logger, func(_ context.Context, path, account string) (config.Effective, error) {
 		resolvedPath, err := config.Path(path)
 		if err != nil {
 			return config.Effective{}, err
@@ -27,7 +27,7 @@ func main() {
 			return config.Effective{}, err
 		}
 		return cfg.Resolve(account)
-	}, func(effective config.Effective) (provisioner.Bootstrapper, error) {
+	}, func(_ context.Context, effective config.Effective) (provisioner.Bootstrapper, error) {
 		return auth.New(effective)
 	})
 	exitCode := cli.Execute(ctx, os.Args[1:], runner, os.Stdout, os.Stderr)

@@ -21,11 +21,20 @@ type Result struct {
 	Region  string
 }
 
+// Error identifies the application phase that failed.
+type Error struct {
+	Phase string
+	Err   error
+}
+
+func (e *Error) Error() string { return fmt.Sprintf("%s: %v", e.Phase, e.Err) }
+func (e *Error) Unwrap() error { return e.Err }
+
 // Load resolves one account's effective configuration.
-type Load func(path, account string) (config.Effective, error)
+type Load func(context.Context, string, string) (config.Effective, error)
 
 // Authenticate constructs isolated provider dependencies for one account.
-type Authenticate func(config.Effective) (provisioner.Bootstrapper, error)
+type Authenticate func(context.Context, config.Effective) (provisioner.Bootstrapper, error)
 
 // Runner coordinates configuration, authentication, and provisioning.
 type Runner struct {
@@ -42,19 +51,25 @@ func NewRunner(logger *slog.Logger, load Load, authenticate Authenticate) *Runne
 // Run performs one authenticated, read-only bootstrap run.
 func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if err := ctx.Err(); err != nil {
-		return Result{}, err
+		return Result{}, &Error{Phase: "start", Err: err}
 	}
 	r.logger.InfoContext(ctx, "provisioning run started", "account", request.Account)
 
-	effective, err := r.load(request.ConfigPath, request.Account)
+	effective, err := r.load(ctx, request.ConfigPath, request.Account)
 	if err != nil {
 		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "config")
-		return Result{}, fmt.Errorf("resolve account configuration: %w", err)
+		return Result{}, &Error{Phase: "config", Err: err}
 	}
-	provider, err := r.authenticate(effective)
+	if err := ctx.Err(); err != nil {
+		return Result{}, &Error{Phase: "config", Err: err}
+	}
+	provider, err := r.authenticate(ctx, effective)
 	if err != nil {
 		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "authentication")
-		return Result{}, fmt.Errorf("authenticate account: %w", err)
+		return Result{}, &Error{Phase: "authentication", Err: err}
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, &Error{Phase: "authentication", Err: err}
 	}
 
 	run := provisioner.Run{
@@ -62,7 +77,7 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	}
 	if err := run.Execute(ctx); err != nil {
 		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "bootstrap")
-		return Result{}, fmt.Errorf("bootstrap account: %w", err)
+		return Result{}, &Error{Phase: "bootstrap", Err: err}
 	}
 
 	r.logger.InfoContext(ctx, "provisioning run completed", "account", request.Account, "region", effective.Region)
