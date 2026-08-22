@@ -57,7 +57,7 @@ func newRootCommand(runner Runner) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("start provisioning run: %w", err)
 			}
-			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "account %s bootstrap complete (region %s)\n", result.Account, result.Region); err != nil {
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "account %s provisioning complete (region %s, instance %s, state %s, public_ip %s)\n", result.Account, result.Region, result.InstanceID, result.InstanceState, result.PublicIP); err != nil {
 				return fmt.Errorf("write command result: %w", err)
 			}
 			return nil
