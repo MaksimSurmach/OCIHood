@@ -34,6 +34,10 @@ defaults:
     max_memory_gb: 12
     max_boot_volume_gb: 50
     allow_exceed: false
+  notifications:
+    enabled: true
+    telegram_chat_id: "123456789"
+    telegram_token_env: OCIHOOD_TELEGRAM_TOKEN
 accounts:
   personal:
     oci_config_path: /home/me/.oci/config
@@ -52,6 +56,10 @@ accounts:
 
 Credential and SSH values are references only; OCIHood never copies their contents into
 project configuration or `config show` output.
+
+Telegram notifications are optional and best-effort. `telegram_token_env` names the environment
+variable containing the bot token; the token itself is never stored in YAML or durable state.
+Account `overrides.notifications.enabled: false` disables inherited global notifications.
 
 The local policy is a configurable safety ceiling, not an Oracle price or Free Tier guarantee.
 Built-in limits match OCIHood's built-in resource defaults. `plan` reports the resolved values,

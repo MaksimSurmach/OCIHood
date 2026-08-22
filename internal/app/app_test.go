@@ -17,6 +17,7 @@ import (
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/launch"
+	"github.com/MaksimSurmach/OCIHood/internal/notification"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
@@ -25,6 +26,92 @@ import (
 type fakeBootstrapper struct {
 	run                                   func(context.Context) error
 	createCalls, updateCalls, deleteCalls int
+}
+
+type fakeNotifier struct {
+	events []notification.Event
+	err    error
+}
+
+type blockingNotifier struct{ release <-chan struct{} }
+
+func (n blockingNotifier) Notify(context.Context, notification.Event) error {
+	<-n.release
+	return nil
+}
+
+func TestNotificationFailureIsMetadataOnly(t *testing.T) {
+	var logs bytes.Buffer
+	runner := &Runner{logger: slog.New(slog.NewTextHandler(&logs, nil)), notifier: &fakeNotifier{err: errors.New("network failed")}}
+	result := Result{}
+	runner.notify(t.Context(), &result, notification.Event{Kind: notification.RunStarted})
+	if len(result.NotificationErrors) != 1 || !strings.Contains(logs.String(), "notification failed") {
+		t.Fatalf("result=%+v logs=%q", result, logs.String())
+	}
+}
+
+func TestRunnerBoundsBlockingNotifier(t *testing.T) {
+	release := make(chan struct{})
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir()}
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+		return &fakeBootstrapper{run: func(context.Context) error { return nil }}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	})
+	runner.SetNotifier(blockingNotifier{release: release})
+	runner.notifyTimeout = 10 * time.Millisecond
+	started := time.Now()
+	result, err := runner.Run(t.Context(), Request{Account: "personal"})
+	close(release)
+	if err != nil || time.Since(started) > time.Second || len(result.NotificationErrors) != 1 || result.NotificationErrors[0] != context.DeadlineExceeded.Error() {
+		t.Fatalf("result=%+v error=%v duration=%s", result, err, time.Since(started))
+	}
+}
+
+func TestRunnerEmitsExactlyOneTerminalFailure(t *testing.T) {
+	tests := []struct {
+		name, phase  string
+		authenticate Authenticate
+		stateFailure bool
+	}{
+		{name: "authentication", phase: "authentication", authenticate: func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+			return nil, errors.New("private provider detail")
+		}},
+		{name: "state", phase: "state", authenticate: func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+			return &fakeBootstrapper{run: func(context.Context) error { return nil }}, nil
+		}, stateFailure: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			if tt.stateFailure {
+				stateDir = filepath.Join(t.TempDir(), "not-a-directory")
+				if err := os.WriteFile(stateDir, []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			effective := config.Effective{Account: "personal", Region: "region", StateDir: stateDir}
+			notifier := &fakeNotifier{}
+			runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, tt.authenticate, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+				return discovery.Result{TargetID: "target"}, nil
+			})
+			runner.SetNotifierFactory(func(config.Effective) notification.Notifier { return notifier })
+			if tt.stateFailure {
+				runner.SetLaunch(func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, reconcile.Decision, capacity.Result, string) (launch.Instance, error) {
+					return launch.Instance{}, nil
+				})
+			}
+			_, err := runner.Run(t.Context(), Request{Account: "personal"})
+			if err == nil || len(notifier.events) != 2 || notifier.events[0].Kind != notification.RunStarted || notifier.events[1].Kind != notification.TerminalFailure || notifier.events[1].Detail != tt.phase+" failed" || strings.Contains(notification.Format(notifier.events[1]), "private provider detail") {
+				t.Fatalf("error=%v events=%+v", err, notifier.events)
+			}
+		})
+	}
+}
+
+func (f *fakeNotifier) Notify(_ context.Context, event notification.Event) error {
+	f.events = append(f.events, event)
+	return f.err
 }
 
 func (f *fakeBootstrapper) Create() { f.createCalls++ }
@@ -342,12 +429,73 @@ func TestRunnerFullProvisioningFlow(t *testing.T) {
 		}
 		return launch.Instance{ID: "instance", State: "RUNNING", PublicIP: "203.0.113.1"}, nil
 	})
+	notifier := &fakeNotifier{}
+	runner.SetNotifier(notifier)
 	got, err := runner.Run(t.Context(), Request{Account: "personal"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.InstanceID != "instance" || got.InstanceState != "RUNNING" || got.PublicIP != "203.0.113.1" {
 		t.Fatalf("result=%+v", got)
+	}
+	want := []notification.Kind{notification.RunStarted, notification.Waiting, notification.CapacityFound, notification.InstanceRunning}
+	if len(notifier.events) != len(want) {
+		t.Fatalf("events=%+v", notifier.events)
+	}
+	for i := range want {
+		if notifier.events[i].Kind != want[i] {
+			t.Fatalf("events=%+v", notifier.events)
+		}
+	}
+}
+
+func TestRunnerEmitsPersistedCapacityPauseAndResume(t *testing.T) {
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir()}
+	notifier := &fakeNotifier{}
+	watches := 0
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+		return &fakeBootstrapper{run: func(context.Context) error { return nil }}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, bool) (capacity.Result, error) {
+		watches++
+		if watches == 2 {
+			return capacity.Result{Kind: capacity.Available, AvailabilityDomain: "AD-1"}, nil
+		}
+		store := state.New(effective.StateDir)
+		value, err := store.Load(effective.Account, "target")
+		if err != nil {
+			t.Fatal(err)
+		}
+		locked, err := store.TryLock(effective.Account, "target")
+		if err != nil {
+			t.Fatal(err)
+		}
+		value.Lifecycle = state.Waiting
+		if err := locked.Save(value); err != nil {
+			t.Fatal(err)
+		}
+		if err := locked.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return capacity.Result{}, context.Canceled
+	})
+	runner.SetNotifier(notifier)
+
+	if _, err := runner.Run(t.Context(), Request{Account: effective.Account}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pause error=%v", err)
+	}
+	if _, err := runner.Run(t.Context(), Request{Account: effective.Account}); err != nil {
+		t.Fatalf("resume error=%v", err)
+	}
+	want := []notification.Kind{notification.RunStarted, notification.Waiting, notification.Paused, notification.RunStarted, notification.Resumed, notification.Waiting, notification.CapacityFound}
+	if len(notifier.events) != len(want) {
+		t.Fatalf("events=%+v", notifier.events)
+	}
+	for i := range want {
+		if notifier.events[i].Kind != want[i] {
+			t.Fatalf("events=%+v", notifier.events)
+		}
 	}
 }
 

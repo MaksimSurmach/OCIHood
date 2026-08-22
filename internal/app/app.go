@@ -15,6 +15,7 @@ import (
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/launch"
+	"github.com/MaksimSurmach/OCIHood/internal/notification"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
@@ -42,6 +43,7 @@ type Result struct {
 	InstanceState      string
 	PublicIP           string
 	Policy             config.PolicyDecision
+	NotificationErrors []string
 }
 
 // Plan is the deterministic, read-only provisioning intent.
@@ -83,14 +85,50 @@ type LaunchInstance func(context.Context, provisioner.Bootstrapper, config.Effec
 
 // Runner coordinates configuration, authentication, and provisioning.
 type Runner struct {
-	logger         *slog.Logger
-	load           Load
-	authenticate   Authenticate
-	discover       Discover
-	watchCapacity  WatchCapacity
-	launchInstance LaunchInstance
-	random         io.Reader
-	now            func() time.Time
+	logger          *slog.Logger
+	load            Load
+	authenticate    Authenticate
+	discover        Discover
+	watchCapacity   WatchCapacity
+	launchInstance  LaunchInstance
+	random          io.Reader
+	now             func() time.Time
+	notifier        notification.Notifier
+	notifierFactory func(config.Effective) notification.Notifier
+	notifyTimeout   time.Duration
+}
+
+const defaultNotificationTimeout = 10 * time.Second
+
+func (r *Runner) SetNotifier(notifier notification.Notifier) { r.notifier = notifier }
+func (r *Runner) SetNotifierFactory(factory func(config.Effective) notification.Notifier) {
+	r.notifierFactory = factory
+}
+
+func (r *Runner) notify(ctx context.Context, result *Result, event notification.Event) {
+	if r.notifier == nil {
+		return
+	}
+	timeout := r.notifyTimeout
+	if timeout <= 0 {
+		timeout = defaultNotificationTimeout
+	}
+	notifyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan error, 1)
+	notifier := r.notifier
+	// ponytail: a notifier ignoring cancellation can strand one goroutine; use isolated workers if that becomes a real integration.
+	go func() { done <- notifier.Notify(notifyCtx, event) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-notifyCtx.Done():
+		err = notifyCtx.Err()
+	}
+	if err != nil {
+		result.NotificationErrors = append(result.NotificationErrors, err.Error())
+		r.logger.WarnContext(ctx, "notification failed", "kind", event.Kind, "error", err)
+	}
 }
 
 // SetLaunch enables the production launch phase while preserving lightweight read-only runners in tests.
@@ -112,31 +150,53 @@ func NewRunner(logger *slog.Logger, load Load, authenticate Authenticate, discov
 }
 
 // Run performs one authenticated, read-only bootstrap run.
-func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
+func (r *Runner) Run(ctx context.Context, request Request) (result Result, runErr error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, &Error{Phase: "start", Err: err}
 	}
 	r.logger.InfoContext(ctx, "provisioning run started", "account", request.Account)
 	effective, provider, discovered, err := r.prepare(ctx, request)
+	if effective.Account != "" && r.notifierFactory != nil {
+		r.notifier = r.notifierFactory(effective)
+	}
+	baseResult := Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID}
+	paused := false
+	event := func(kind notification.Kind, detail string) notification.Event {
+		return notification.Event{Kind: kind, Account: effective.Account, Region: effective.Region, TargetID: discovered.TargetID, Detail: detail}
+	}
+	if effective.Account != "" {
+		r.notify(ctx, &baseResult, event(notification.RunStarted, ""))
+		defer func() {
+			if runErr == nil || paused {
+				return
+			}
+			phase := "provisioning"
+			var appErr *Error
+			if errors.As(runErr, &appErr) {
+				phase = appErr.Phase
+			}
+			r.notify(ctx, &result, event(notification.TerminalFailure, phase+" failed"))
+		}()
+	}
 	if err != nil {
-		return Result{}, err
+		return baseResult, err
 	}
 	policy := config.EvaluatePolicy(effective)
-	baseResult := Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Policy: policy}
+	baseResult.Policy = policy
 	if !policy.Allowed {
 		return baseResult, &Error{Phase: "policy", Err: fmt.Errorf("resource policy rejected: %s", strings.Join(policy.Violations, "; "))}
 	}
 	if r.launchInstance != nil {
 		guard, lockErr := state.New(effective.StateDir).TryRunLock(effective.Account, discovered.TargetID)
 		if lockErr != nil {
-			return Result{}, &Error{Phase: "state", Err: lockErr}
+			return baseResult, &Error{Phase: "state", Err: lockErr}
 		}
 		defer func() { _ = guard.Close() }()
 	}
-	decision, err := reconcileAndPersist(effective, discovered, r.random, r.now().UTC())
+	decision, resumed, err := reconcileAndPersist(effective, discovered, r.random, r.now().UTC())
 	if err != nil {
 		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "state")
-		return Result{}, &Error{Phase: "state", Err: err}
+		return baseResult, &Error{Phase: "state", Err: err}
 	}
 	var capacityResult capacity.Result
 	var instance launch.Instance
@@ -145,18 +205,28 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if r.launchInstance != nil && createSafe {
 		sshKey, err = os.ReadFile(effective.SSHPublicKeyPath)
 		if err != nil {
-			return Result{}, &Error{Phase: "launch", Err: fmt.Errorf("read SSH public key: %w", err)}
+			return baseResult, &Error{Phase: "launch", Err: fmt.Errorf("read SSH public key: %w", err)}
 		}
 	}
 	for {
 		if r.watchCapacity != nil && createSafe {
+			if resumed {
+				r.notify(ctx, &baseResult, event(notification.Resumed, "capacity watch resumed"))
+				resumed = false
+			}
+			r.notify(ctx, &baseResult, event(notification.Waiting, "capacity check started"))
 			capacityResult, err = r.watchCapacity(ctx, provider, effective, discovered, request.Once)
 			if err != nil {
-				return Result{}, &Error{Phase: "capacity", Err: err}
+				if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && waitingState(effective, discovered.TargetID) {
+					paused = true
+					r.notify(context.WithoutCancel(ctx), &baseResult, event(notification.Paused, "capacity watch paused"))
+				}
+				return baseResult, &Error{Phase: "capacity", Err: err}
 			}
 			if request.Once && capacityResult.Kind == capacity.Unavailable {
 				break
 			}
+			r.notify(ctx, &baseResult, event(notification.CapacityFound, capacityResult.AvailabilityDomain))
 		}
 		if r.launchInstance == nil || (!createSafe && decision.InstanceID == "") {
 			break
@@ -164,19 +234,20 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 		instance, err = r.launchInstance(ctx, provider, effective, discovered, decision, capacityResult, string(sshKey))
 		var launchErr *launch.Error
 		if errors.As(err, &launchErr) && launchErr.Kind == launch.OutOfCapacity && createSafe {
+			r.notify(ctx, &baseResult, event(notification.Degraded, "capacity changed before launch"))
 			if request.Once {
 				capacityResult = capacity.Result{Kind: capacity.Unavailable}
 				break
 			}
 			attempt, persistErr := newAttemptAndPersist(effective, discovered.TargetID, r.random, r.now().UTC())
 			if persistErr != nil {
-				return Result{}, &Error{Phase: "state", Err: persistErr}
+				return baseResult, &Error{Phase: "state", Err: persistErr}
 			}
 			decision.Attempt = &attempt
 			continue
 		}
 		if err != nil {
-			return Result{}, &Error{Phase: "launch", Err: err}
+			return baseResult, &Error{Phase: "launch", Err: err}
 		}
 		break
 	}
@@ -189,6 +260,9 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	baseResult.Decision, baseResult.Attempt = decision.Kind, decision.Attempt
 	baseResult.Capacity, baseResult.AvailabilityDomain = capacityResult.Kind, capacityResult.AvailabilityDomain
 	baseResult.InstanceID, baseResult.InstanceState, baseResult.PublicIP = instanceID, instance.State, instance.PublicIP
+	if instanceID != "" {
+		r.notify(ctx, &baseResult, notification.Event{Kind: notification.InstanceRunning, Account: effective.Account, Region: effective.Region, TargetID: discovered.TargetID, InstanceID: instanceID, PublicIP: instance.PublicIP})
+	}
 	return baseResult, nil
 }
 
@@ -258,23 +332,23 @@ func (r *Runner) prepare(ctx context.Context, request Request) (config.Effective
 	}
 	provider, err := r.authenticate(ctx, effective)
 	if err != nil {
-		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "authentication", Err: err}
+		return effective, nil, discovery.Result{}, &Error{Phase: "authentication", Err: err}
 	}
 	if err := ctx.Err(); err != nil {
-		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "authentication", Err: err}
+		return effective, nil, discovery.Result{}, &Error{Phase: "authentication", Err: err}
 	}
 	if err := (provisioner.Run{Account: request.Account, Settings: effective, Logger: r.logger, Bootstrapper: provider}).Execute(ctx); err != nil {
-		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "bootstrap", Err: err}
+		return effective, provider, discovery.Result{}, &Error{Phase: "bootstrap", Err: err}
 	}
 	if err := ctx.Err(); err != nil {
-		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "bootstrap", Err: err}
+		return effective, provider, discovery.Result{}, &Error{Phase: "bootstrap", Err: err}
 	}
 	discovered, err := r.discover(ctx, provider, effective)
 	if err != nil {
-		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "discovery", Err: err}
+		return effective, provider, discovery.Result{}, &Error{Phase: "discovery", Err: err}
 	}
 	if err := ctx.Err(); err != nil {
-		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "discovery", Err: err}
+		return effective, provider, discovered, &Error{Phase: "discovery", Err: err}
 	}
 	return effective, provider, discovered, nil
 }
@@ -305,11 +379,11 @@ func newAttemptAndPersist(effective config.Effective, targetID string, random io
 
 const attemptValidity = 24 * time.Hour
 
-func reconcileAndPersist(effective config.Effective, discovered discovery.Result, random io.Reader, now time.Time) (reconcile.Decision, error) {
+func reconcileAndPersist(effective config.Effective, discovered discovery.Result, random io.Reader, now time.Time) (reconcile.Decision, bool, error) {
 	store := state.New(effective.StateDir)
 	locked, err := store.TryLock(effective.Account, discovered.TargetID)
 	if err != nil {
-		return reconcile.Decision{}, err
+		return reconcile.Decision{}, false, err
 	}
 	defer func() { _ = locked.Close() }()
 
@@ -318,10 +392,11 @@ func reconcileAndPersist(effective config.Effective, discovered discovery.Result
 	if errors.Is(err, state.ErrNotFound) {
 		value = state.State{Account: effective.Account, TargetID: discovered.TargetID, Lifecycle: state.Discovered}
 	} else if err != nil {
-		return reconcile.Decision{}, err
+		return reconcile.Decision{}, false, err
 	} else {
 		local = value.ReconcileState()
 	}
+	resumed := value.Lifecycle == state.Waiting
 	decision := reconcile.Decide(reconcile.Input{
 		TargetID: discovered.TargetID, Account: effective.Account,
 		State: local, Instances: discovered.Instances, Now: now,
@@ -338,7 +413,7 @@ func reconcileAndPersist(effective config.Effective, discovered discovery.Result
 	case reconcile.DecisionCreate, reconcile.DecisionNewAttemptSafe:
 		attempt, err := reconcile.NewAttempt(random, now, attemptValidity)
 		if err != nil {
-			return reconcile.Decision{}, err
+			return reconcile.Decision{}, false, err
 		}
 		decision.Attempt = &attempt
 		value.Lifecycle, value.AttemptID, value.RetryToken = state.Provisioning, attempt.ID, attempt.RetryToken
@@ -347,10 +422,15 @@ func reconcileAndPersist(effective config.Effective, discovered discovery.Result
 		value.Lifecycle = state.Discovered
 	}
 	if err := locked.Save(value); err != nil {
-		return reconcile.Decision{}, err
+		return reconcile.Decision{}, false, err
 	}
 	if decision.Kind == reconcile.DecisionConflict {
-		return decision, errors.New(decision.Reason)
+		return decision, false, errors.New(decision.Reason)
 	}
-	return decision, nil
+	return decision, resumed, nil
+}
+
+func waitingState(effective config.Effective, targetID string) bool {
+	value, err := state.New(effective.StateDir).Load(effective.Account, targetID)
+	return err == nil && value.Lifecycle == state.Waiting
 }
