@@ -59,6 +59,50 @@ func TestConfiglessMissingRequiredInputStopsBeforeProvider(t *testing.T) {
 
 func pointer(value string) *string { return &value }
 
+func TestPlanIsDeterministicAndReadOnly(t *testing.T) {
+	t.Parallel()
+	effective := config.Effective{Account: "personal", Region: "region", CompartmentID: "compartment", StateDir: t.TempDir(), Shape: "shape", OCPUs: 2, MemoryGB: 12, BootVolumeGB: 50, PublicIP: true}
+	targetID := reconcile.Target{Account: "personal", Region: "region", CompartmentID: "compartment", SubnetID: "subnet", ImageID: "image", Shape: "shape", OCPUs: 2, MemoryGB: 12, BootVolumeGB: 50, PublicIP: true}.ID()
+	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
+	writes := 0
+	var instances []reconcile.Instance
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: targetID, CompartmentID: "compartment", Image: discovery.Image{ID: "image"}, VCN: discovery.VCN{ID: "vcn"}, Subnet: discovery.Subnet{ID: "subnet"}, AvailabilityDomains: []string{"AD-1"}, Instances: instances}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error) {
+		writes++
+		return capacity.Result{}, nil
+	})
+	runner.SetLaunch(func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, reconcile.Decision, capacity.Result, string) (launch.Instance, error) {
+		writes++
+		return launch.Instance{}, nil
+	})
+	first, err := runner.Plan(t.Context(), Request{Account: "personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := runner.Plan(t.Context(), Request{Account: "personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, second) || first.Action != reconcile.DecisionCreate || first.ImageID != "image" || first.SubnetID != "subnet" || writes != 0 {
+		t.Fatalf("plans=%+v / %+v writes=%d", first, second, writes)
+	}
+	if _, err := state.New(effective.StateDir).Load("personal", targetID); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("plan persisted state: %v", err)
+	}
+	tags := reconcile.OwnershipTags(targetID, "personal")
+	instances = []reconcile.Instance{{ID: "instance-1", Lifecycle: reconcile.LifecycleActive, Tags: tags}, {ID: "unrelated", Lifecycle: reconcile.LifecycleActive}}
+	satisfied, err := runner.Plan(t.Context(), Request{Account: "personal"})
+	if err != nil || satisfied.Action != reconcile.DecisionAlreadySatisfied || len(satisfied.Instances) != 1 {
+		t.Fatalf("already-satisfied plan=%+v err=%v", satisfied, err)
+	}
+	instances = append(instances, reconcile.Instance{ID: "instance-2", Lifecycle: reconcile.LifecycleActive, Tags: tags})
+	conflict, err := runner.Plan(t.Context(), Request{Account: "personal"})
+	if err != nil || conflict.Action != reconcile.DecisionConflict || writes != 0 {
+		t.Fatalf("conflict plan=%+v err=%v writes=%d", conflict, err, writes)
+	}
+}
+
 func TestRunnerRestartLoadsAttemptBeforeCreateDecision(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

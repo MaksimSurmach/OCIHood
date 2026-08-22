@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
+	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
 	"github.com/spf13/cobra"
 )
@@ -18,6 +20,7 @@ import (
 // Runner performs one OCIHood provisioning run.
 type Runner interface {
 	Run(context.Context, app.Request) (app.Result, error)
+	Plan(context.Context, app.Request) (app.Plan, error)
 }
 
 // Execute runs the CLI and returns its process exit code.
@@ -72,10 +75,56 @@ func newRootCommand(runner Runner) *cobra.Command {
 	values.bind(start)
 	_ = start.MarkFlagRequired("account")
 	root.AddCommand(start)
+	plan := &cobra.Command{
+		Use: "plan", Short: "Show resolved provisioning intent without modifying OCI", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			overrides, configless := values.overrides(cmd)
+			result, err := runner.Plan(cmd.Context(), app.Request{ConfigPath: configPath, Account: account, Overrides: overrides, Configless: configPath == "" && configless})
+			if err != nil {
+				return fmt.Errorf("plan provisioning run: %w", err)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "account: %s\ntarget_id: %s\nregion: %s\ncompartment_id: %s\nshape: %s\nocpus: %d\nmemory_gb: %d\nimage_id: %s\nvcn_id: %s\nsubnet_id: %s\nboot_volume_gb: %d\npublic_ip: %t\navailability_domains: %s\nmanaged_instances: %s\naction: %s\nreason: %s\n", result.Account, result.TargetID, result.Region, result.CompartmentID, result.Shape, result.OCPUs, result.MemoryGB, result.ImageID, result.VCNID, result.SubnetID, result.BootVolumeGB, result.PublicIP, strings.Join(result.AvailabilityDomains, ","), renderInstances(result.Instances), renderAction(result.Action), result.Reason)
+			return err
+		},
+	}
+	plan.Flags().StringVar(&account, "account", "", "account name")
+	values.bind(plan)
+	_ = plan.MarkFlagRequired("account")
+	root.AddCommand(plan)
 	root.AddCommand(newConfigCommand(&configPath))
 	root.AddCommand(newStatusCommand(&configPath))
 
 	return root
+}
+
+func renderAction(kind reconcile.DecisionKind) string {
+	switch kind {
+	case reconcile.DecisionCreate, reconcile.DecisionNewAttemptSafe, reconcile.DecisionRetrySameAttempt:
+		return "create"
+	case reconcile.DecisionAlreadySatisfied:
+		return "already-satisfied"
+	case reconcile.DecisionConflict, reconcile.DecisionResumeReconcile:
+		return "blocked/conflict/ambiguous"
+	default:
+		return "blocked/conflict/ambiguous"
+	}
+}
+
+func renderInstances(instances []reconcile.Instance) string {
+	values := make([]string, len(instances))
+	for i, instance := range instances {
+		var lifecycle string
+		switch instance.Lifecycle {
+		case reconcile.LifecycleActive:
+			lifecycle = "active"
+		case reconcile.LifecycleTerminated:
+			lifecycle = "terminated"
+		default:
+			lifecycle = "unknown"
+		}
+		values[i] = fmt.Sprintf("%s(%s)", instance.ID, lifecycle)
+	}
+	return strings.Join(values, ",")
 }
 
 type startValues struct {
