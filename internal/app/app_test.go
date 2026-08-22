@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/MaksimSurmach/OCIHood/internal/capacity"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
+	"github.com/MaksimSurmach/OCIHood/internal/launch"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
@@ -85,6 +88,70 @@ func TestRunnerRunsCapacityWatcherOnlyForCreateSafeDecision(t *testing.T) {
 	}
 	if calls != 1 || got.Capacity != capacity.Available || got.AvailabilityDomain != "AD-1" {
 		t.Fatalf("result=%+v calls=%d", got, calls)
+	}
+}
+
+func TestRunnerFullProvisioningFlow(t *testing.T) {
+	t.Parallel()
+	sshKey := filepath.Join(t.TempDir(), "id.pub")
+	if err := os.WriteFile(sshKey, []byte("ssh-ed25519 test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir(), SSHPublicKeyPath: sshKey}
+	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target", TenancyID: "root", CompartmentID: "compartment", Image: discovery.Image{ID: "image"}, Subnet: discovery.Subnet{ID: "subnet"}, AvailabilityDomains: []string{"AD-1"}}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error) {
+		return capacity.Result{Kind: capacity.Available, AvailabilityDomain: "AD-1"}, nil
+	})
+	runner.SetLaunch(func(_ context.Context, gotProvider provisioner.Bootstrapper, _ config.Effective, gotDiscovery discovery.Result, decision reconcile.Decision, placement capacity.Result, key string) (launch.Instance, error) {
+		if gotProvider != provider || gotDiscovery.TargetID != "target" || decision.Attempt == nil || placement.AvailabilityDomain != "AD-1" || key != "ssh-ed25519 test" {
+			t.Fatalf("launch inputs provider=%T discovery=%+v decision=%+v placement=%+v key=%q", gotProvider, gotDiscovery, decision, placement, key)
+		}
+		return launch.Instance{ID: "instance", State: "RUNNING", PublicIP: "203.0.113.1"}, nil
+	})
+	got, err := runner.Run(t.Context(), Request{Account: "personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InstanceID != "instance" || got.InstanceState != "RUNNING" || got.PublicIP != "203.0.113.1" {
+		t.Fatalf("result=%+v", got)
+	}
+}
+
+func TestRunnerCapacityRaceReturnsToWatcher(t *testing.T) {
+	t.Parallel()
+	sshKey := filepath.Join(t.TempDir(), "id.pub")
+	if err := os.WriteFile(sshKey, []byte("key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir(), SSHPublicKeyPath: sshKey}
+	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
+	watches, launches := 0, 0
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error) {
+		watches++
+		return capacity.Result{Kind: capacity.Available, AvailabilityDomain: fmt.Sprintf("AD-%d", watches)}, nil
+	})
+	runner.SetLaunch(func(_ context.Context, _ provisioner.Bootstrapper, _ config.Effective, _ discovery.Result, decision reconcile.Decision, placement capacity.Result, _ string) (launch.Instance, error) {
+		launches++
+		if decision.Attempt == nil {
+			t.Fatal("launch lost logical attempt")
+		}
+		if launches == 1 {
+			return launch.Instance{}, &launch.Error{Kind: launch.OutOfCapacity, Err: errors.New("capacity race")}
+		}
+		if placement.AvailabilityDomain != "AD-2" {
+			t.Fatalf("placement=%+v", placement)
+		}
+		return launch.Instance{ID: "instance", State: "RUNNING"}, nil
+	})
+	if _, err := runner.Run(t.Context(), Request{Account: "personal"}); err != nil {
+		t.Fatal(err)
+	}
+	if watches != 2 || launches != 2 {
+		t.Fatalf("watches=%d launches=%d", watches, launches)
 	}
 }
 

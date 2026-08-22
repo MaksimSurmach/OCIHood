@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/capacity"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
+	"github.com/MaksimSurmach/OCIHood/internal/launch"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
@@ -32,6 +34,9 @@ type Result struct {
 	Attempt            *reconcile.Attempt
 	Capacity           capacity.Kind
 	AvailabilityDomain string
+	InstanceID         string
+	InstanceState      string
+	PublicIP           string
 }
 
 // Error identifies the application phase that failed.
@@ -55,16 +60,23 @@ type Discover func(context.Context, provisioner.Bootstrapper, config.Effective) 
 // WatchCapacity waits for advisory capacity after a create-safe reconciliation decision.
 type WatchCapacity func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error)
 
+// LaunchInstance executes the mutating and lifecycle portion after reconciliation.
+type LaunchInstance func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, reconcile.Decision, capacity.Result, string) (launch.Instance, error)
+
 // Runner coordinates configuration, authentication, and provisioning.
 type Runner struct {
-	logger        *slog.Logger
-	load          Load
-	authenticate  Authenticate
-	discover      Discover
-	watchCapacity WatchCapacity
-	random        io.Reader
-	now           func() time.Time
+	logger         *slog.Logger
+	load           Load
+	authenticate   Authenticate
+	discover       Discover
+	watchCapacity  WatchCapacity
+	launchInstance LaunchInstance
+	random         io.Reader
+	now            func() time.Time
 }
+
+// SetLaunch enables the production launch phase while preserving lightweight read-only runners in tests.
+func (r *Runner) SetLaunch(launchInstance LaunchInstance) { r.launchInstance = launchInstance }
 
 // NewRunner creates the application runner.
 func NewRunner(logger *slog.Logger, load Load, authenticate Authenticate, discover Discover, watchCapacity ...WatchCapacity) *Runner {
@@ -123,16 +135,38 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 		return Result{}, &Error{Phase: "state", Err: err}
 	}
 	var capacityResult capacity.Result
-	if r.watchCapacity != nil && (decision.Kind == reconcile.DecisionCreate || decision.Kind == reconcile.DecisionNewAttemptSafe || decision.Kind == reconcile.DecisionRetrySameAttempt) {
-		capacityResult, err = r.watchCapacity(ctx, provider, effective, discovered)
+	var instance launch.Instance
+	createSafe := decision.Kind == reconcile.DecisionCreate || decision.Kind == reconcile.DecisionNewAttemptSafe || decision.Kind == reconcile.DecisionRetrySameAttempt
+	var sshKey []byte
+	if r.launchInstance != nil && createSafe {
+		sshKey, err = os.ReadFile(effective.SSHPublicKeyPath)
 		if err != nil {
-			r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "capacity")
-			return Result{}, &Error{Phase: "capacity", Err: err}
+			return Result{}, &Error{Phase: "launch", Err: fmt.Errorf("read SSH public key: %w", err)}
 		}
+	}
+	for {
+		if r.watchCapacity != nil && createSafe {
+			capacityResult, err = r.watchCapacity(ctx, provider, effective, discovered)
+			if err != nil {
+				return Result{}, &Error{Phase: "capacity", Err: err}
+			}
+		}
+		if r.launchInstance == nil || (!createSafe && decision.InstanceID == "") {
+			break
+		}
+		instance, err = r.launchInstance(ctx, provider, effective, discovered, decision, capacityResult, string(sshKey))
+		var launchErr *launch.Error
+		if errors.As(err, &launchErr) && launchErr.Kind == launch.OutOfCapacity && createSafe {
+			continue
+		}
+		if err != nil {
+			return Result{}, &Error{Phase: "launch", Err: err}
+		}
+		break
 	}
 
 	r.logger.InfoContext(ctx, "provisioning run completed", "account", request.Account, "region", effective.Region)
-	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain}, nil
+	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain, InstanceID: instance.ID, InstanceState: instance.State, PublicIP: instance.PublicIP}, nil
 }
 
 const attemptValidity = 24 * time.Hour

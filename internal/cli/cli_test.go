@@ -185,7 +185,7 @@ func TestHelpDoesNotRunApplication(t *testing.T) {
 func TestStartSuccessWritesResultToStdout(t *testing.T) {
 	t.Parallel()
 
-	runner := &fakeRunner{result: app.Result{Account: "personal", Region: "eu-frankfurt-1"}}
+	runner := &fakeRunner{result: app.Result{Account: "personal", Region: "eu-frankfurt-1", InstanceID: "ocid.instance", InstanceState: "RUNNING", PublicIP: "203.0.113.1"}}
 	var stdout, stderr bytes.Buffer
 
 	if code := Execute(t.Context(), []string{"--config", "config.yaml", "start", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {
@@ -197,7 +197,7 @@ func TestStartSuccessWritesResultToStdout(t *testing.T) {
 	if runner.request != (app.Request{ConfigPath: "config.yaml", Account: "personal"}) {
 		t.Errorf("request = %+v", runner.request)
 	}
-	if got := stdout.String(); got != "account personal bootstrap complete (region eu-frankfurt-1)\n" {
+	if got := stdout.String(); got != "account personal provisioning complete (region eu-frankfurt-1, instance ocid.instance, state RUNNING, public_ip 203.0.113.1)\n" {
 		t.Errorf("stdout = %q, want result", got)
 	}
 	if stderr.Len() != 0 {
