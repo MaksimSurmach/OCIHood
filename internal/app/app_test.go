@@ -449,6 +449,56 @@ func TestRunnerFullProvisioningFlow(t *testing.T) {
 	}
 }
 
+func TestRunnerEmitsPersistedCapacityPauseAndResume(t *testing.T) {
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir()}
+	notifier := &fakeNotifier{}
+	watches := 0
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+		return &fakeBootstrapper{run: func(context.Context) error { return nil }}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, bool) (capacity.Result, error) {
+		watches++
+		if watches == 2 {
+			return capacity.Result{Kind: capacity.Available, AvailabilityDomain: "AD-1"}, nil
+		}
+		store := state.New(effective.StateDir)
+		value, err := store.Load(effective.Account, "target")
+		if err != nil {
+			t.Fatal(err)
+		}
+		locked, err := store.TryLock(effective.Account, "target")
+		if err != nil {
+			t.Fatal(err)
+		}
+		value.Lifecycle = state.Waiting
+		if err := locked.Save(value); err != nil {
+			t.Fatal(err)
+		}
+		if err := locked.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return capacity.Result{}, context.Canceled
+	})
+	runner.SetNotifier(notifier)
+
+	if _, err := runner.Run(t.Context(), Request{Account: effective.Account}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pause error=%v", err)
+	}
+	if _, err := runner.Run(t.Context(), Request{Account: effective.Account}); err != nil {
+		t.Fatalf("resume error=%v", err)
+	}
+	want := []notification.Kind{notification.RunStarted, notification.Waiting, notification.Paused, notification.RunStarted, notification.Resumed, notification.Waiting, notification.CapacityFound}
+	if len(notifier.events) != len(want) {
+		t.Fatalf("events=%+v", notifier.events)
+	}
+	for i := range want {
+		if notifier.events[i].Kind != want[i] {
+			t.Fatalf("events=%+v", notifier.events)
+		}
+	}
+}
+
 func TestRunnerCapacityRaceReturnsToWatcher(t *testing.T) {
 	t.Parallel()
 	sshKey := filepath.Join(t.TempDir(), "id.pub")

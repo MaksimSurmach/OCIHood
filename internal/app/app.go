@@ -160,13 +160,14 @@ func (r *Runner) Run(ctx context.Context, request Request) (result Result, runEr
 		r.notifier = r.notifierFactory(effective)
 	}
 	baseResult := Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID}
+	paused := false
 	event := func(kind notification.Kind, detail string) notification.Event {
 		return notification.Event{Kind: kind, Account: effective.Account, Region: effective.Region, TargetID: discovered.TargetID, Detail: detail}
 	}
 	if effective.Account != "" {
 		r.notify(ctx, &baseResult, event(notification.RunStarted, ""))
 		defer func() {
-			if runErr == nil {
+			if runErr == nil || paused {
 				return
 			}
 			phase := "provisioning"
@@ -192,7 +193,7 @@ func (r *Runner) Run(ctx context.Context, request Request) (result Result, runEr
 		}
 		defer func() { _ = guard.Close() }()
 	}
-	decision, err := reconcileAndPersist(effective, discovered, r.random, r.now().UTC())
+	decision, resumed, err := reconcileAndPersist(effective, discovered, r.random, r.now().UTC())
 	if err != nil {
 		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "state")
 		return baseResult, &Error{Phase: "state", Err: err}
@@ -209,9 +210,17 @@ func (r *Runner) Run(ctx context.Context, request Request) (result Result, runEr
 	}
 	for {
 		if r.watchCapacity != nil && createSafe {
+			if resumed {
+				r.notify(ctx, &baseResult, event(notification.Resumed, "capacity watch resumed"))
+				resumed = false
+			}
 			r.notify(ctx, &baseResult, event(notification.Waiting, "capacity check started"))
 			capacityResult, err = r.watchCapacity(ctx, provider, effective, discovered, request.Once)
 			if err != nil {
+				if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && waitingState(effective, discovered.TargetID) {
+					paused = true
+					r.notify(context.WithoutCancel(ctx), &baseResult, event(notification.Paused, "capacity watch paused"))
+				}
 				return baseResult, &Error{Phase: "capacity", Err: err}
 			}
 			if request.Once && capacityResult.Kind == capacity.Unavailable {
@@ -370,11 +379,11 @@ func newAttemptAndPersist(effective config.Effective, targetID string, random io
 
 const attemptValidity = 24 * time.Hour
 
-func reconcileAndPersist(effective config.Effective, discovered discovery.Result, random io.Reader, now time.Time) (reconcile.Decision, error) {
+func reconcileAndPersist(effective config.Effective, discovered discovery.Result, random io.Reader, now time.Time) (reconcile.Decision, bool, error) {
 	store := state.New(effective.StateDir)
 	locked, err := store.TryLock(effective.Account, discovered.TargetID)
 	if err != nil {
-		return reconcile.Decision{}, err
+		return reconcile.Decision{}, false, err
 	}
 	defer func() { _ = locked.Close() }()
 
@@ -383,10 +392,11 @@ func reconcileAndPersist(effective config.Effective, discovered discovery.Result
 	if errors.Is(err, state.ErrNotFound) {
 		value = state.State{Account: effective.Account, TargetID: discovered.TargetID, Lifecycle: state.Discovered}
 	} else if err != nil {
-		return reconcile.Decision{}, err
+		return reconcile.Decision{}, false, err
 	} else {
 		local = value.ReconcileState()
 	}
+	resumed := value.Lifecycle == state.Waiting
 	decision := reconcile.Decide(reconcile.Input{
 		TargetID: discovered.TargetID, Account: effective.Account,
 		State: local, Instances: discovered.Instances, Now: now,
@@ -403,7 +413,7 @@ func reconcileAndPersist(effective config.Effective, discovered discovery.Result
 	case reconcile.DecisionCreate, reconcile.DecisionNewAttemptSafe:
 		attempt, err := reconcile.NewAttempt(random, now, attemptValidity)
 		if err != nil {
-			return reconcile.Decision{}, err
+			return reconcile.Decision{}, false, err
 		}
 		decision.Attempt = &attempt
 		value.Lifecycle, value.AttemptID, value.RetryToken = state.Provisioning, attempt.ID, attempt.RetryToken
@@ -412,10 +422,15 @@ func reconcileAndPersist(effective config.Effective, discovered discovery.Result
 		value.Lifecycle = state.Discovered
 	}
 	if err := locked.Save(value); err != nil {
-		return reconcile.Decision{}, err
+		return reconcile.Decision{}, false, err
 	}
 	if decision.Kind == reconcile.DecisionConflict {
-		return decision, errors.New(decision.Reason)
+		return decision, false, errors.New(decision.Reason)
 	}
-	return decision, nil
+	return decision, resumed, nil
+}
+
+func waitingState(effective config.Effective, targetID string) bool {
+	value, err := state.New(effective.StateDir).Load(effective.Account, targetID)
+	return err == nil && value.Lifecycle == state.Waiting
 }
