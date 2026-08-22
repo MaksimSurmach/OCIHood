@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MaksimSurmach/OCIHood/internal/capacity"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
@@ -61,6 +62,29 @@ func TestRunnerRestartLoadsAttemptBeforeCreateDecision(t *testing.T) {
 	}
 	if restarted.Decision != reconcile.DecisionRetrySameAttempt || restarted.Attempt == nil || restarted.Attempt.ID != first.Attempt.ID {
 		t.Fatalf("restart decision = %+v, want retry original attempt", restarted)
+	}
+}
+
+func TestRunnerRunsCapacityWatcherOnlyForCreateSafeDecision(t *testing.T) {
+	t.Parallel()
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir()}
+	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
+	calls := 0
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target", TenancyID: "root", AvailabilityDomains: []string{"AD-1"}}, nil
+	}, func(ctx context.Context, gotProvider provisioner.Bootstrapper, gotEffective config.Effective, gotDiscovery discovery.Result) (capacity.Result, error) {
+		calls++
+		if gotProvider != provider || gotEffective.Account != "personal" || gotDiscovery.TargetID != "target" || ctx.Err() != nil {
+			t.Fatalf("capacity inputs are wrong")
+		}
+		return capacity.Result{Kind: capacity.Available, AvailabilityDomain: "AD-1"}, nil
+	})
+	got, err := runner.Run(t.Context(), Request{Account: "personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || got.Capacity != capacity.Available || got.AvailabilityDomain != "AD-1" {
+		t.Fatalf("result=%+v calls=%d", got, calls)
 	}
 }
 

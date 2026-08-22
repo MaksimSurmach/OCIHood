@@ -75,6 +75,18 @@ If multiple target states exist, it fails instead of choosing one.
 `start` performs discovery, loads this state under the target lock, runs the reconciliation
 decision, and persists the resulting lifecycle before any future launch step may proceed.
 
+## Capacity watcher
+
+For create-safe decisions, `start` probes OCI Compute Capacity Report using the root tenancy,
+requested shape/OCPUs/memory, and every discovered availability domain in sorted round-robin
+order. A positive report is advisory. Unsupported or unauthorized probing returns a distinct
+fallback result for the later launch step; it is not treated as no capacity.
+
+Full rotations use exponential backoff from `retry_min` through `retry_max` with bounded 20%
+jitter. `request_timeout` bounds each probe. Throttling guidance can extend the delay. The last
+AD, retry count, next attempt, and status are stored atomically, so restart resumes after the
+persisted delay and continues with the next AD. Cancellation interrupts requests and waits.
+
 ## Development
 
 The supported toolchain is Go 1.27.0 and golangci-lint 2.13.1.
