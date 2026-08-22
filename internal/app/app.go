@@ -2,8 +2,10 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"time"
 
@@ -26,6 +28,7 @@ type Result struct {
 	Region   string
 	TargetID string
 	Decision reconcile.DecisionKind
+	Attempt  *reconcile.Attempt
 }
 
 // Error identifies the application phase that failed.
@@ -52,11 +55,13 @@ type Runner struct {
 	load         Load
 	authenticate Authenticate
 	discover     Discover
+	random       io.Reader
+	now          func() time.Time
 }
 
 // NewRunner creates the application runner.
 func NewRunner(logger *slog.Logger, load Load, authenticate Authenticate, discover Discover) *Runner {
-	return &Runner{logger: logger, load: load, authenticate: authenticate, discover: discover}
+	return &Runner{logger: logger, load: load, authenticate: authenticate, discover: discover, random: rand.Reader, now: time.Now}
 }
 
 // Run performs one authenticated, read-only bootstrap run.
@@ -101,17 +106,19 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, &Error{Phase: "discovery", Err: err}
 	}
-	decision, err := reconcileAndPersist(effective, discovered)
+	decision, err := reconcileAndPersist(effective, discovered, r.random, r.now().UTC())
 	if err != nil {
 		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "state")
 		return Result{}, &Error{Phase: "state", Err: err}
 	}
 
 	r.logger.InfoContext(ctx, "provisioning run completed", "account", request.Account, "region", effective.Region)
-	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind}, nil
+	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt}, nil
 }
 
-func reconcileAndPersist(effective config.Effective, discovered discovery.Result) (reconcile.Decision, error) {
+const attemptValidity = 24 * time.Hour
+
+func reconcileAndPersist(effective config.Effective, discovered discovery.Result, random io.Reader, now time.Time) (reconcile.Decision, error) {
 	store := state.New(effective.StateDir)
 	locked, err := store.TryLock(effective.Account, discovered.TargetID)
 	if err != nil {
@@ -130,10 +137,10 @@ func reconcileAndPersist(effective config.Effective, discovered discovery.Result
 	}
 	decision := reconcile.Decide(reconcile.Input{
 		TargetID: discovered.TargetID, Account: effective.Account,
-		State: local, Instances: discovered.Instances, Now: time.Now().UTC(),
+		State: local, Instances: discovered.Instances, Now: now,
 	})
 	value.LastResult = decision.Reason
-	value.UpdatedAt = time.Now().UTC()
+	value.UpdatedAt = now
 	switch decision.Kind {
 	case reconcile.DecisionAlreadySatisfied:
 		value.Lifecycle, value.InstanceID = state.Running, decision.InstanceID
@@ -141,6 +148,14 @@ func reconcileAndPersist(effective config.Effective, discovered discovery.Result
 		value.Lifecycle = state.Provisioning
 	case reconcile.DecisionConflict:
 		value.Lifecycle, value.LastError = state.Failed, decision.Reason
+	case reconcile.DecisionCreate, reconcile.DecisionNewAttemptSafe:
+		attempt, err := reconcile.NewAttempt(random, now, attemptValidity)
+		if err != nil {
+			return reconcile.Decision{}, err
+		}
+		decision.Attempt = &attempt
+		value.Lifecycle, value.AttemptID, value.RetryToken = state.Provisioning, attempt.ID, attempt.RetryToken
+		value.AttemptValidTo, value.LastAttempt = attempt.ValidUntil, now
 	default:
 		value.Lifecycle = state.Discovered
 	}
