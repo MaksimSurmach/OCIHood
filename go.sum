@@ -1,3 +1,5 @@
+github.com/MaksimSurmach/oci-go-sdk/v65 v65.123.2-ocihood.1 h1:o32JTL2qJiGHgT3U7lIUC2NuK5sqd+qTyJ+m+qVxQBE=
+github.com/MaksimSurmach/oci-go-sdk/v65 v65.123.2-ocihood.1/go.mod h1:Pzy+BpgkDesvGZXEHgslwhIYobHCPHg6wRta1mWnlqQ=
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
@@ -9,8 +11,6 @@ github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
 github.com/kr/pretty v0.3.1/go.mod h1:hoEshYVHaxMs3cyo3Yncou5ZscifuDolrwPKZanG3xk=
 github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=
 github.com/kr/text v0.2.0/go.mod h1:eLer722TekiGuMkidMxC/pM04lWEeraHUUmBw8l2grE=
-github.com/oracle/oci-go-sdk/v65 v65.123.2 h1:Xg/OEjuj+xNkJKgjTVDG9R5rq7oxKIKHWIeNFZd9etU=
-github.com/oracle/oci-go-sdk/v65 v65.123.2/go.mod h1:Pzy+BpgkDesvGZXEHgslwhIYobHCPHg6wRta1mWnlqQ=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=

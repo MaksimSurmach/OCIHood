@@ -294,9 +294,6 @@ func TestSDKContractErrorClassificationMalformedAndCancellation(t *testing.T) {
 	})
 	for _, name := range []string{"cancel", "timeout"} {
 		t.Run(name, func(t *testing.T) {
-			if raceEnabled {
-				t.Skip("OCI SDK v65 Retry has a known response race when context cancellation wins")
-			}
 			started := make(chan struct{})
 			fake := newFakeOCI(t, func(_ http.ResponseWriter, r *http.Request) { close(started); <-r.Context().Done() })
 			provider := ocidiscovery.New(fake.clients(t))
