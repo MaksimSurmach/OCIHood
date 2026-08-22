@@ -4,17 +4,49 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MaksimSurmach/OCIHood/internal/app"
+	"github.com/MaksimSurmach/OCIHood/internal/config"
+	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
 )
 
 type fakeRunner struct {
-	calls  int
-	result string
-	err    error
-	run    func(context.Context) (string, error)
+	calls   int
+	request app.Request
+	result  app.Result
+	err     error
+	run     func(context.Context, app.Request) (app.Result, error)
+}
+
+type integrationBootstrapper struct{ calls int }
+
+func (f *integrationBootstrapper) Validate(context.Context) error {
+	f.calls++
+	return nil
+}
+
+func TestStartCommandToProvisioner(t *testing.T) {
+	t.Parallel()
+	provider := &integrationBootstrapper{}
+	runner := app.NewRunner(slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), func(path, account string) (config.Effective, error) {
+		if path != "config.yaml" || account != "personal" {
+			t.Fatalf("load(%q, %q)", path, account)
+		}
+		return config.Effective{Account: account, Region: "eu-frankfurt-1"}, nil
+	}, func(config.Effective) (provisioner.Bootstrapper, error) { return provider, nil })
+	var stdout, stderr bytes.Buffer
+
+	if code := Execute(t.Context(), []string{"--config", "config.yaml", "start", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {
+		t.Fatalf("Execute() code = %d, stderr = %q", code, stderr.String())
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", provider.calls)
+	}
 }
 
 func TestConfigCommands(t *testing.T) {
@@ -50,10 +82,11 @@ func TestConfigCommands(t *testing.T) {
 	}
 }
 
-func (f *fakeRunner) Run(ctx context.Context) (string, error) {
+func (f *fakeRunner) Run(ctx context.Context, request app.Request) (app.Result, error) {
 	f.calls++
+	f.request = request
 	if f.run != nil {
-		return f.run(ctx)
+		return f.run(ctx, request)
 	}
 	return f.result, f.err
 }
@@ -94,16 +127,19 @@ func TestHelpDoesNotRunApplication(t *testing.T) {
 func TestStartSuccessWritesResultToStdout(t *testing.T) {
 	t.Parallel()
 
-	runner := &fakeRunner{result: "created instance\n"}
+	runner := &fakeRunner{result: app.Result{Account: "personal", Region: "eu-frankfurt-1"}}
 	var stdout, stderr bytes.Buffer
 
-	if code := Execute(t.Context(), []string{"start"}, runner, &stdout, &stderr); code != 0 {
+	if code := Execute(t.Context(), []string{"--config", "config.yaml", "start", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {
 		t.Fatalf("Execute() code = %d, stderr = %q", code, stderr.String())
 	}
 	if runner.calls != 1 {
 		t.Errorf("runner calls = %d, want 1", runner.calls)
 	}
-	if got := stdout.String(); got != "created instance\n" {
+	if runner.request != (app.Request{ConfigPath: "config.yaml", Account: "personal"}) {
+		t.Errorf("request = %+v", runner.request)
+	}
+	if got := stdout.String(); got != "account personal bootstrap complete (region eu-frankfurt-1)\n" {
 		t.Errorf("stdout = %q, want result", got)
 	}
 	if stderr.Len() != 0 {
@@ -117,7 +153,7 @@ func TestStartFailureWritesDiagnosticToStderr(t *testing.T) {
 	runner := &fakeRunner{err: errors.New("service unavailable")}
 	var stdout, stderr bytes.Buffer
 
-	if code := Execute(t.Context(), []string{"start"}, runner, &stdout, &stderr); code == 0 {
+	if code := Execute(t.Context(), []string{"start", "--account", "personal"}, runner, &stdout, &stderr); code == 0 {
 		t.Fatal("Execute() code = 0, want non-zero")
 	}
 	if runner.calls != 1 {
@@ -138,7 +174,8 @@ func TestInvalidInputDoesNotRunApplication(t *testing.T) {
 		want string
 	}{
 		{name: "unknown command", args: []string{"missing"}, want: "unknown command"},
-		{name: "unknown flag", args: []string{"start", "--missing"}, want: "unknown flag"},
+		{name: "unknown flag", args: []string{"start", "--account", "personal", "--missing"}, want: "unknown flag"},
+		{name: "missing account", args: []string{"start"}, want: "required flag"},
 	}
 
 	for _, tt := range tests {
@@ -167,16 +204,16 @@ func TestStartPropagatesCancellation(t *testing.T) {
 	t.Parallel()
 
 	started := make(chan struct{})
-	runner := &fakeRunner{run: func(ctx context.Context) (string, error) {
+	runner := &fakeRunner{run: func(ctx context.Context, _ app.Request) (app.Result, error) {
 		close(started)
 		<-ctx.Done()
-		return "", ctx.Err()
+		return app.Result{}, ctx.Err()
 	}}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan int)
 
 	go func() {
-		done <- Execute(ctx, []string{"start"}, runner, &bytes.Buffer{}, &bytes.Buffer{})
+		done <- Execute(ctx, []string{"start", "--account", "personal"}, runner, &bytes.Buffer{}, &bytes.Buffer{})
 	}()
 	<-started
 	cancel()
