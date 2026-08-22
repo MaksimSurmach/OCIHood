@@ -142,13 +142,23 @@ func Decide(in Input) Decision {
 	}
 
 	active := make([]Instance, 0, 1)
+	unknown := make([]Instance, 0, 1)
 	for _, instance := range in.Instances {
-		if IsOwned(instance.Tags, in.TargetID, in.Account) && instance.Lifecycle == LifecycleActive {
+		if !IsOwned(instance.Tags, in.TargetID, in.Account) {
+			continue
+		}
+		switch instance.Lifecycle {
+		case LifecycleActive:
 			active = append(active, instance)
+		case LifecycleUnknown:
+			unknown = append(unknown, instance)
 		}
 	}
-	if len(active) > 1 {
-		return Decision{Kind: DecisionConflict, Reason: fmt.Sprintf("found %d active managed instances for target", len(active))}
+	if len(active)+len(unknown) > 1 {
+		return Decision{Kind: DecisionConflict, Reason: fmt.Sprintf("found %d active or unknown managed instances for target", len(active)+len(unknown))}
+	}
+	if len(unknown) == 1 {
+		return Decision{Kind: DecisionResumeReconcile, InstanceID: unknown[0].ID, Reason: "managed instance lifecycle is unknown"}
 	}
 	if len(active) == 1 {
 		if in.State != nil && in.State.InstanceID != "" && in.State.InstanceID != active[0].ID {
@@ -160,6 +170,9 @@ func Decide(in Input) Decision {
 		return Decision{Kind: DecisionCreate, Reason: "no local state or active managed instance"}
 	}
 	if in.State.Attempt != nil {
+		if strings.TrimSpace(in.State.Attempt.ID) == "" || strings.TrimSpace(in.State.Attempt.RetryToken) == "" || in.State.Attempt.ValidUntil.IsZero() {
+			return Decision{Kind: DecisionConflict, Reason: "local state contains an incomplete launch attempt"}
+		}
 		if in.Now.Before(in.State.Attempt.ValidUntil) {
 			return Decision{Kind: DecisionRetrySameAttempt, Attempt: in.State.Attempt, Reason: "in-flight attempt remains retryable"}
 		}

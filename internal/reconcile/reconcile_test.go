@@ -57,6 +57,7 @@ func TestDecide(t *testing.T) {
 		return Instance{ID: id, Lifecycle: lifecycle, Tags: OwnershipTags("target", "personal")}
 	}
 	validAttempt := &Attempt{ID: "attempt", RetryToken: "token", ValidUntil: now.Add(time.Hour)}
+	expiredAttempt := &Attempt{ID: "attempt", RetryToken: "token", ValidUntil: now}
 	tests := []struct {
 		name             string
 		input            Input
@@ -69,9 +70,15 @@ func TestDecide(t *testing.T) {
 		{name: "state points to active match", input: Input{State: &State{TargetID: "target", InstanceID: "one"}, Instances: []Instance{owned("one", LifecycleActive)}}, expected: DecisionAlreadySatisfied, expectedInstance: "one"},
 		{name: "state instance missing", input: Input{State: &State{TargetID: "target", InstanceID: "missing"}}, expected: DecisionNewAttemptSafe},
 		{name: "ambiguous launch retries same attempt", input: Input{State: &State{TargetID: "target", Attempt: validAttempt}}, expected: DecisionRetrySameAttempt, expectedAttempt: validAttempt},
-		{name: "expired attempt permits new attempt", input: Input{State: &State{TargetID: "target", Attempt: &Attempt{ValidUntil: now}}}, expected: DecisionNewAttemptSafe},
+		{name: "expired attempt permits new attempt", input: Input{State: &State{TargetID: "target", Attempt: expiredAttempt}}, expected: DecisionNewAttemptSafe},
 		{name: "terminated match does not satisfy", input: Input{Instances: []Instance{owned("old", LifecycleTerminated)}}, expected: DecisionCreate},
+		{name: "unknown match resumes reconciliation", input: Input{Instances: []Instance{owned("unknown", LifecycleUnknown)}}, expected: DecisionResumeReconcile, expectedInstance: "unknown"},
+		{name: "unknown plus terminated resumes reconciliation", input: Input{Instances: []Instance{owned("unknown", LifecycleUnknown), owned("old", LifecycleTerminated)}}, expected: DecisionResumeReconcile, expectedInstance: "unknown"},
+		{name: "unknown plus active conflicts", input: Input{Instances: []Instance{owned("unknown", LifecycleUnknown), owned("active", LifecycleActive)}}, expected: DecisionConflict},
 		{name: "multiple active matches conflict", input: Input{Instances: []Instance{owned("one", LifecycleActive), owned("two", LifecycleActive)}}, expected: DecisionConflict},
+		{name: "attempt missing id conflicts", input: Input{State: &State{TargetID: "target", Attempt: &Attempt{RetryToken: "token", ValidUntil: now.Add(time.Hour)}}}, expected: DecisionConflict},
+		{name: "attempt missing retry token conflicts", input: Input{State: &State{TargetID: "target", Attempt: &Attempt{ID: "attempt", ValidUntil: now.Add(time.Hour)}}}, expected: DecisionConflict},
+		{name: "attempt missing validity conflicts", input: Input{State: &State{TargetID: "target", Attempt: &Attempt{ID: "attempt", RetryToken: "token"}}}, expected: DecisionConflict},
 		{name: "similarly named unrelated instance ignored", input: Input{Instances: []Instance{{ID: "lookalike", Lifecycle: LifecycleActive, Tags: map[string]string{ManagedTag: "true"}}}}, expected: DecisionCreate},
 		{name: "stale incompatible state conflicts", input: Input{State: &State{TargetID: "old"}}, expected: DecisionConflict},
 		{name: "provider match repairs stale instance reference", input: Input{State: &State{TargetID: "target", InstanceID: "old"}, Instances: []Instance{owned("new", LifecycleActive)}}, expected: DecisionResumeReconcile, expectedInstance: "new"},
