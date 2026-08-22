@@ -21,6 +21,10 @@ import (
 	"github.com/MaksimSurmach/OCIHood/internal/state"
 )
 
+const unrelatedInstanceID = "unrelated"
+
+func claimedUnrelated(instanceID string) bool { return instanceID == unrelatedInstanceID }
+
 type crashCloud struct {
 	mu         sync.Mutex
 	byToken    map[string]string
@@ -74,7 +78,7 @@ func (c *crashCloud) Get(_ context.Context, _, id string) (launch.Instance, erro
 func (c *crashCloud) observations(targetID, account string) []reconcile.Instance {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	result := []reconcile.Instance{{ID: "unrelated", Lifecycle: reconcile.LifecycleActive, Tags: map[string]string{"owner": "other"}}}
+	result := []reconcile.Instance{{ID: unrelatedInstanceID, Lifecycle: reconcile.LifecycleActive, Tags: map[string]string{"owner": "other"}}}
 	for id, instance := range c.instances {
 		lifecycle := reconcile.LifecycleActive
 		if instance.State == "TERMINATED" {
@@ -194,7 +198,11 @@ func (h *crashHarness) runner(store func(launch.StateStore) launch.Store, sleepe
 }
 
 func (h *crashHarness) run(runner *Runner) (Result, error) {
-	return runner.Run(h.t.Context(), Request{Account: h.effective.Account})
+	result, err := runner.Run(h.t.Context(), Request{Account: h.effective.Account})
+	if claimedUnrelated(result.InstanceID) {
+		h.t.Fatal("application result claimed unrelated instance")
+	}
+	return result, err
 }
 
 func (h *crashHarness) durable() state.State {
@@ -214,7 +222,22 @@ func (h *crashHarness) assertSafe() {
 	if count := h.cloud.activeOwned(); count > 1 {
 		h.t.Fatalf("active owned instances=%d", count)
 	}
-	_ = h.durable()
+	if claimedUnrelated(h.durable().InstanceID) {
+		h.t.Fatal("durable state claimed unrelated instance")
+	}
+}
+
+func TestCrashSafetyDoesNotClaimUnrelatedInstance(t *testing.T) {
+	h := newCrashHarness(t)
+	runner := h.runner(nil, instantSleeper{}, nil)
+	runner.SetLaunch(nil)
+	result, err := h.run(runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable := h.durable(); result.InstanceID != "" || durable.InstanceID != "" {
+		t.Fatalf("result instance=%q durable instance=%q", result.InstanceID, durable.InstanceID)
+	}
 }
 
 func TestCrashSafeProvisioningBoundaries(t *testing.T) {
@@ -319,7 +342,7 @@ func TestCrashSafeProvisioningBoundaries(t *testing.T) {
 		_, _ = h.run(first)
 		attempt := h.durable()
 		h.discover = func() []reconcile.Instance {
-			return []reconcile.Instance{{ID: "unrelated", Lifecycle: reconcile.LifecycleActive}}
+			return []reconcile.Instance{{ID: unrelatedInstanceID, Lifecycle: reconcile.LifecycleActive}}
 		}
 		if _, err := h.run(h.runner(nil, instantSleeper{}, nil)); err != nil {
 			t.Fatal(err)
