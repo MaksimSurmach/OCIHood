@@ -63,6 +63,7 @@ func TestClientProbeClassifiesProviderFailures(t *testing.T) {
 		{name: "transient", err: serviceError{status: 503}, want: domain.Transient},
 		{name: "fatal authentication", err: serviceError{status: 401}, want: domain.Fatal},
 		{name: "canceled", err: context.Canceled, want: domain.Canceled},
+		{name: "timeout", err: context.DeadlineExceeded, want: domain.Transient},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

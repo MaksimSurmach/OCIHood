@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
+	"github.com/MaksimSurmach/OCIHood/internal/breaker"
 	"github.com/MaksimSurmach/OCIHood/internal/capacity"
 	"github.com/MaksimSurmach/OCIHood/internal/cli"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
@@ -68,7 +69,11 @@ func main() {
 				resume.NextAD = (index + 1) % len(discovered.AvailabilityDomains)
 			}
 		}
-		watcher := capacity.Watcher{Client: ocicapacity.New(clients), Store: store, Sleeper: capacity.TimerSleeper{}, Random: capacity.CryptoRandom{}, Logger: runner.Logger(), Now: time.Now, Config: capacity.Config{RequestTimeout: effective.RequestTimeout, InitialInterval: effective.RetryMin, MaxInterval: effective.RetryMax, Jitter: .2}}
+		circuit, err := newCircuit(effective, "compute/capacity", runner.Logger())
+		if err != nil {
+			return capacity.Result{}, err
+		}
+		watcher := capacity.Watcher{Client: capacity.BreakerClient{Client: ocicapacity.New(clients), Circuit: circuit}, Store: store, Sleeper: capacity.TimerSleeper{}, Random: capacity.CryptoRandom{}, Logger: runner.Logger(), Now: time.Now, Config: capacity.Config{RequestTimeout: effective.RequestTimeout, InitialInterval: effective.RetryMin, MaxInterval: effective.RetryMax, Jitter: .2}}
 		return watcher.Watch(ctx, capacity.Input{TargetID: discovered.TargetID, TenancyID: discovered.TenancyID, Shape: effective.Shape, AvailabilityDomains: discovered.AvailabilityDomains, OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, Resume: resume, Once: once})
 	})
 	runner.SetLaunch(func(ctx context.Context, bootstrapper provisioner.Bootstrapper, effective config.Effective, discovered discovery.Result, decision reconcile.Decision, placement capacity.Result, sshKey string) (launch.Instance, error) {
@@ -81,7 +86,11 @@ func main() {
 			attempt = &reconcile.Attempt{}
 		}
 		store := launch.StateStore{Store: state.New(effective.StateDir), Account: effective.Account, TargetID: discovered.TargetID, Now: time.Now}
-		return (launch.Orchestrator{Provider: ocilaunch.New(clients), Store: store, Sleeper: launch.TimerSleeper{}}).Run(ctx, launch.Input{
+		circuit, err := newCircuit(effective, "compute/instance", runner.Logger())
+		if err != nil {
+			return launch.Instance{}, err
+		}
+		return (launch.Orchestrator{Provider: launch.BreakerProvider{Provider: ocilaunch.New(clients), Circuit: circuit}, Store: store, Sleeper: launch.TimerSleeper{}}).Run(ctx, launch.Input{
 			Request:            launch.Request{TargetID: discovered.TargetID, Account: effective.Account, CompartmentID: discovered.CompartmentID, AvailabilityDomain: placement.AvailabilityDomain, Shape: effective.Shape, ImageID: discovered.Image.ID, SubnetID: discovered.Subnet.ID, SSHPublicKey: sshKey, OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, BootVolumeGB: effective.BootVolumeGB, PublicIP: effective.PublicIP, Attempt: *attempt},
 			ExistingInstanceID: decision.InstanceID, RequestTimeout: effective.RequestTimeout, RetryMin: effective.RetryMin, RetryMax: effective.RetryMax,
 		})
@@ -95,4 +104,9 @@ func main() {
 	exitCode := cli.Execute(ctx, os.Args[1:], runner, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(exitCode)
+}
+
+func newCircuit(effective config.Effective, family string, logger *slog.Logger) (*breaker.Circuit, error) {
+	name := effective.Account + "/" + effective.Region + "/" + family
+	return breaker.New(name, breaker.Config{Failures: uint32(effective.Breaker.Failures), HalfOpenRequests: uint32(effective.Breaker.HalfOpenRequests), Interval: effective.Breaker.Interval, OpenTimeout: effective.Breaker.OpenTimeout}, logger)
 }

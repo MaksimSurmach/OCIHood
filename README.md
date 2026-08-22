@@ -23,6 +23,11 @@ defaults:
   request_timeout: 30s
   retry_min: 30s
   retry_max: 15m
+  circuit_breaker:
+    failures: 5
+    half_open_requests: 1
+    interval: 5m
+    open_timeout: 1m
   shape: VM.Standard.A1.Flex
   ocpus: 2
   memory_gb: 12
@@ -135,6 +140,12 @@ Full rotations use exponential backoff from `retry_min` through `retry_max` with
 jitter. `request_timeout` bounds each probe. Throttling guidance can extend the delay. The last
 AD, retry count, next attempt, and status are stored atomically, so restart resumes after the
 persisted delay and continues with the next AD. Cancellation interrupts requests and waits.
+
+Circuit breakers are runtime-only and keyed by account, region, OCI service, and operation family
+(`compute/capacity` or `compute/instance`). AD rotation cannot bypass an open breaker, while one
+family cannot block the other. Existing retry/backoff owns timing; the breaker only fast-fails
+sustained transport, timeout, throttling, or OCI 5xx failures. No-capacity, expected empty/not-found,
+other 4xx, and cancellation outcomes do not trip it.
 
 ## Development
 
