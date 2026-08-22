@@ -156,6 +156,33 @@ func TestConfigShowAcceptsConfiglessOverridesWithoutReadingReferences(t *testing
 	}
 }
 
+func TestConfigShowDefaultFileReceivesCLIOverrides(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	path, err := config.DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := "defaults:\n  shape: file-shape\n  public_ip: true\naccounts:\n  personal:\n    oci_profile: FILE\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"config", "show", "--account", "personal", "--public-ip=false"}, &fakeRunner{}, &stdout, &stderr); code != 0 {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+	for _, want := range []string{"oci_profile: FILE", "shape: file-shape", "public_ip: false"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("output missing %q: %s", want, stdout.String())
+		}
+	}
+}
+
 func TestConfigCommands(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

@@ -3,8 +3,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
@@ -214,20 +216,16 @@ func newConfigCommand(configPath *string) *cobra.Command {
 		Use: "show", Short: "Show effective non-secret account configuration", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			overrides, configless := values.overrides(cmd)
+			path, err := config.Path(*configPath)
+			if err != nil {
+				return err
+			}
+			cfg, err := config.Load(path)
 			var effective config.Effective
-			var err error
-			if *configPath == "" && configless {
+			if err == nil {
+				effective, err = cfg.Resolve(account)
+			} else if *configPath == "" && configless && errors.Is(err, os.ErrNotExist) {
 				effective, err = config.Defaults(account)
-			} else {
-				var path string
-				path, err = config.Path(*configPath)
-				if err == nil {
-					var cfg config.File
-					cfg, err = config.Load(path)
-					if err == nil {
-						effective, err = cfg.Resolve(account)
-					}
-				}
 			}
 			if err != nil {
 				return err
