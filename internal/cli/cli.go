@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/MaksimSurmach/OCIHood/internal/app"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/spf13/cobra"
 )
 
 // Runner performs one OCIHood provisioning run.
 type Runner interface {
-	Run(context.Context) (string, error)
+	Run(context.Context, app.Request) (app.Result, error)
 }
 
 // Execute runs the CLI and returns its process exit code.
@@ -32,6 +33,7 @@ func Execute(ctx context.Context, args []string, runner Runner, stdout, stderr i
 
 func newRootCommand(runner Runner) *cobra.Command {
 	var configPath string
+	var account string
 	root := &cobra.Command{
 		Use:           "ocihood",
 		Short:         "Provision Oracle Cloud Infrastructure resources",
@@ -44,23 +46,24 @@ func newRootCommand(runner Runner) *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&configPath, "config", "", "configuration file (default: OS user config directory/ocihood/config.yaml)")
 
-	root.AddCommand(&cobra.Command{
+	start := &cobra.Command{
 		Use:   "start",
 		Short: "Start one provisioning run",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			result, err := runner.Run(cmd.Context())
+			result, err := runner.Run(cmd.Context(), app.Request{ConfigPath: configPath, Account: account})
 			if err != nil {
 				return fmt.Errorf("start provisioning run: %w", err)
 			}
-			if result != "" {
-				if _, err := io.WriteString(cmd.OutOrStdout(), result); err != nil {
-					return fmt.Errorf("write command result: %w", err)
-				}
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "account %s bootstrap complete (region %s)\n", result.Account, result.Region); err != nil {
+				return fmt.Errorf("write command result: %w", err)
 			}
 			return nil
 		},
-	})
+	}
+	start.Flags().StringVar(&account, "account", "", "account name")
+	_ = start.MarkFlagRequired("account")
+	root.AddCommand(start)
 	root.AddCommand(newConfigCommand(&configPath))
 
 	return root
