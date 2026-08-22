@@ -109,11 +109,9 @@ func (o Orchestrator) Run(ctx context.Context, in Input) (Instance, error) {
 				}
 				break
 			}
-			_ = o.Store.Failed(err)
-			return Instance{}, &Error{Kind: LimitExceeded, Err: err}
+			return Instance{}, o.failed(&Error{Kind: LimitExceeded, Err: err})
 		case Fatal:
-			_ = o.Store.Failed(err)
-			return Instance{}, &Error{Kind: result.Kind, Err: err}
+			return Instance{}, o.failed(&Error{Kind: result.Kind, Err: err})
 		case Canceled:
 			return Instance{}, &Error{Kind: Canceled, Err: err}
 		case Transient, Ambiguous, "":
@@ -124,7 +122,7 @@ func (o Orchestrator) Run(ctx context.Context, in Input) (Instance, error) {
 				} else {
 					err = fmt.Errorf("launch retry budget exhausted: %w", err)
 				}
-				return Instance{}, &Error{Kind: result.Kind, Err: err}
+				return Instance{}, o.failed(&Error{Kind: result.Kind, Err: err})
 			}
 			if result.RetryAfter > delay {
 				delay = result.RetryAfter
@@ -146,6 +144,9 @@ func (o Orchestrator) Run(ctx context.Context, in Input) (Instance, error) {
 		if err != nil {
 			var classified *Error
 			if errors.As(err, &classified) && (classified.Kind == Fatal || classified.Kind == LimitExceeded || classified.Kind == Canceled) {
+				if classified.Kind != Canceled {
+					err = o.failed(err)
+				}
 				return Instance{}, err
 			}
 			if sleepErr := o.Sleeper.Sleep(ctx, in.RetryMin); sleepErr != nil {
@@ -184,13 +185,19 @@ func (o Orchestrator) Run(ctx context.Context, in Input) (Instance, error) {
 			return instance, nil
 		case "TERMINATED", "TERMINATING":
 			err := fmt.Errorf("instance %s reached terminal state %s", instance.ID, instance.State)
-			_ = o.Store.Failed(err)
-			return Instance{}, err
+			return Instance{}, o.failed(err)
 		}
 		if err := o.Sleeper.Sleep(ctx, in.RetryMin); err != nil {
 			return Instance{}, err
 		}
 	}
+}
+
+func (o Orchestrator) failed(cause error) error {
+	if err := o.Store.Failed(cause); err != nil {
+		return errors.Join(cause, fmt.Errorf("persist failed instance: %w", err))
+	}
+	return cause
 }
 
 type Error struct {

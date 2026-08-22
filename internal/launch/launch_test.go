@@ -47,11 +47,14 @@ func (f *fakeProvider) Get(_ context.Context, _, id string) (Instance, error) {
 	return got, nil
 }
 
-type fakeStore struct{ events []string }
+type fakeStore struct {
+	events    []string
+	failedErr error
+}
 
 func (s *fakeStore) Accepted(string) error   { s.events = append(s.events, "accepted"); return nil }
 func (s *fakeStore) Finished(Instance) error { s.events = append(s.events, "running"); return nil }
-func (s *fakeStore) Failed(error) error      { s.events = append(s.events, "failed"); return nil }
+func (s *fakeStore) Failed(error) error      { s.events = append(s.events, "failed"); return s.failedErr }
 
 type fakeSleeper struct {
 	calls  int
@@ -130,10 +133,22 @@ func TestOrchestratorClassifiesAndCancels(t *testing.T) {
 			launches:     []Result{{Kind: Transient}, {Kind: Transient}, {Kind: Transient}},
 			launchErrors: []error{cause, cause, cause},
 		}
-		_, err := (Orchestrator{Provider: provider, Store: &fakeStore{}, Sleeper: &fakeSleeper{}}).Run(t.Context(), validInput())
+		store := &fakeStore{}
+		_, err := (Orchestrator{Provider: provider, Store: store, Sleeper: &fakeSleeper{}}).Run(t.Context(), validInput())
 		var got *Error
-		if !errors.As(err, &got) || got.Kind != Transient || !errors.Is(err, cause) || len(provider.launchRequests) != 3 {
-			t.Fatalf("err=%v launches=%d", err, len(provider.launchRequests))
+		if !errors.As(err, &got) || got.Kind != Transient || !errors.Is(err, cause) || len(provider.launchRequests) != 3 || !reflect.DeepEqual(store.events, []string{"failed"}) {
+			t.Fatalf("err=%v launches=%d events=%v", err, len(provider.launchRequests), store.events)
+		}
+	})
+	t.Run("failed state write preserves terminal cause", func(t *testing.T) {
+		cause := errors.New("fatal request")
+		writeErr := errors.New("disk full")
+		provider := &fakeProvider{launches: []Result{{Kind: Fatal}}, launchErrors: []error{cause}}
+		store := &fakeStore{failedErr: writeErr}
+		_, err := (Orchestrator{Provider: provider, Store: store, Sleeper: &fakeSleeper{}}).Run(t.Context(), validInput())
+		var got *Error
+		if !errors.As(err, &got) || got.Kind != Fatal || !errors.Is(err, cause) || !errors.Is(err, writeErr) {
+			t.Fatalf("err=%v", err)
 		}
 	})
 	t.Run("cancellation during retry", func(t *testing.T) {
