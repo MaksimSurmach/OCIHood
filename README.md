@@ -138,6 +138,10 @@ go build -o ocihood ./cmd/ocihood
 
 The build and tests require no OCI credentials or external services.
 
+For optional MAX-360 live-OCI validation, safely map boundaries 1, 5-8, and 10 to controlled
+cancellation/restart runs. Boundaries 2-4 require injected response or persistence failures, and
+boundary 9 requires controlled capacity exhaustion, so they remain deterministic local tests.
+
 ## Logging
 
 OCIHood uses the standard library's `log/slog` package. Operational logs and diagnostics go to stderr; final command results go to stdout. Prefer structured fields such as `logger.Info("request complete", "region", region)` over formatted messages. Never log secrets, tokens, private keys, credentials or their contents.

@@ -118,6 +118,13 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if r.launchInstance != nil {
+		guard, lockErr := state.New(effective.StateDir).TryRunLock(effective.Account, discovered.TargetID)
+		if lockErr != nil {
+			return Result{}, &Error{Phase: "state", Err: lockErr}
+		}
+		defer func() { _ = guard.Close() }()
+	}
 	decision, err := reconcileAndPersist(effective, discovered, r.random, r.now().UTC())
 	if err != nil {
 		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "state")
