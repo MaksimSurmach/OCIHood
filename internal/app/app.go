@@ -95,7 +95,10 @@ type Runner struct {
 	now             func() time.Time
 	notifier        notification.Notifier
 	notifierFactory func(config.Effective) notification.Notifier
+	notifyTimeout   time.Duration
 }
+
+const defaultNotificationTimeout = 10 * time.Second
 
 func (r *Runner) SetNotifier(notifier notification.Notifier) { r.notifier = notifier }
 func (r *Runner) SetNotifierFactory(factory func(config.Effective) notification.Notifier) {
@@ -106,7 +109,23 @@ func (r *Runner) notify(ctx context.Context, result *Result, event notification.
 	if r.notifier == nil {
 		return
 	}
-	if err := r.notifier.Notify(ctx, event); err != nil {
+	timeout := r.notifyTimeout
+	if timeout <= 0 {
+		timeout = defaultNotificationTimeout
+	}
+	notifyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan error, 1)
+	notifier := r.notifier
+	// ponytail: a notifier ignoring cancellation can strand one goroutine; use isolated workers if that becomes a real integration.
+	go func() { done <- notifier.Notify(notifyCtx, event) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-notifyCtx.Done():
+		err = notifyCtx.Err()
+	}
+	if err != nil {
 		result.NotificationErrors = append(result.NotificationErrors, err.Error())
 		r.logger.WarnContext(ctx, "notification failed", "kind", event.Kind, "error", err)
 	}

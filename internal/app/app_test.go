@@ -33,6 +33,13 @@ type fakeNotifier struct {
 	err    error
 }
 
+type blockingNotifier struct{ release <-chan struct{} }
+
+func (n blockingNotifier) Notify(context.Context, notification.Event) error {
+	<-n.release
+	return nil
+}
+
 func TestNotificationFailureIsMetadataOnly(t *testing.T) {
 	var logs bytes.Buffer
 	runner := &Runner{logger: slog.New(slog.NewTextHandler(&logs, nil)), notifier: &fakeNotifier{err: errors.New("network failed")}}
@@ -40,6 +47,24 @@ func TestNotificationFailureIsMetadataOnly(t *testing.T) {
 	runner.notify(t.Context(), &result, notification.Event{Kind: notification.RunStarted})
 	if len(result.NotificationErrors) != 1 || !strings.Contains(logs.String(), "notification failed") {
 		t.Fatalf("result=%+v logs=%q", result, logs.String())
+	}
+}
+
+func TestRunnerBoundsBlockingNotifier(t *testing.T) {
+	release := make(chan struct{})
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir()}
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+		return &fakeBootstrapper{run: func(context.Context) error { return nil }}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	})
+	runner.SetNotifier(blockingNotifier{release: release})
+	runner.notifyTimeout = 10 * time.Millisecond
+	started := time.Now()
+	result, err := runner.Run(t.Context(), Request{Account: "personal"})
+	close(release)
+	if err != nil || time.Since(started) > time.Second || len(result.NotificationErrors) != 1 || result.NotificationErrors[0] != context.DeadlineExceeded.Error() {
+		t.Fatalf("result=%+v error=%v duration=%s", result, err, time.Since(started))
 	}
 }
 
