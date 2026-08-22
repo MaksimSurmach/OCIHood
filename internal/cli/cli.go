@@ -127,16 +127,17 @@ func newRootCommand(runner Runner) *cobra.Command {
 const resultSchema = "ocihood.start/v1"
 
 type commandDocument struct {
-	Schema        string                 `json:"schema"`
-	Account       string                 `json:"account"`
-	TargetID      string                 `json:"target_id,omitempty"`
-	Outcome       string                 `json:"outcome"`
-	Region        string                 `json:"region,omitempty"`
-	InstanceID    string                 `json:"instance_id,omitempty"`
-	InstanceState string                 `json:"instance_state,omitempty"`
-	PublicIP      string                 `json:"public_ip,omitempty"`
-	Policy        *config.PolicyDecision `json:"policy,omitempty"`
-	Error         struct {
+	Schema             string                 `json:"schema"`
+	Account            string                 `json:"account"`
+	TargetID           string                 `json:"target_id,omitempty"`
+	Outcome            string                 `json:"outcome"`
+	Region             string                 `json:"region,omitempty"`
+	InstanceID         string                 `json:"instance_id,omitempty"`
+	InstanceState      string                 `json:"instance_state,omitempty"`
+	PublicIP           string                 `json:"public_ip,omitempty"`
+	Policy             *config.PolicyDecision `json:"policy,omitempty"`
+	NotificationErrors []string               `json:"notification_errors,omitempty"`
+	Error              struct {
 		Category string `json:"category,omitempty"`
 		Message  string `json:"message,omitempty"`
 	} `json:"error,omitempty"`
@@ -198,7 +199,7 @@ func (v executionValues) write(out io.Writer, result commandDocument) error {
 }
 
 func commandResult(account string, result app.Result, err error) (commandDocument, int) {
-	doc := commandDocument{Schema: resultSchema, Account: account, TargetID: result.TargetID, Outcome: "success", Region: result.Region, InstanceID: result.InstanceID, InstanceState: result.InstanceState, PublicIP: result.PublicIP}
+	doc := commandDocument{Schema: resultSchema, Account: account, TargetID: result.TargetID, Outcome: "success", Region: result.Region, InstanceID: result.InstanceID, InstanceState: result.InstanceState, PublicIP: result.PublicIP, NotificationErrors: result.NotificationErrors}
 	if result.Policy.Allowed || result.Policy.Overridden || len(result.Policy.Violations) > 0 {
 		doc.Policy = &result.Policy
 	}

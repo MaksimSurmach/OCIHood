@@ -79,6 +79,34 @@ func TestBuiltInDefaults(t *testing.T) {
 	}
 }
 
+func TestNotificationPrecedenceAndDisable(t *testing.T) {
+	t.Parallel()
+	cfg, err := Load(writeConfig(t, `
+defaults:
+  notifications:
+    enabled: true
+    telegram_chat_id: global
+    telegram_token_env: TELEGRAM_TOKEN
+accounts:
+  enabled: {}
+  disabled:
+    overrides:
+      notifications:
+        enabled: false
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled, err := cfg.Resolve("enabled")
+	if err != nil || !enabled.Notifications.Enabled || enabled.Notifications.TelegramChat != "global" {
+		t.Fatalf("enabled=%+v err=%v", enabled.Notifications, err)
+	}
+	disabled, err := cfg.Resolve("disabled")
+	if err != nil || disabled.Notifications.Enabled {
+		t.Fatalf("disabled=%+v err=%v", disabled.Notifications, err)
+	}
+}
+
 func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

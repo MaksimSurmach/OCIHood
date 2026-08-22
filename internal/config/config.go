@@ -35,17 +35,30 @@ type File struct {
 
 // Settings contains shared runtime values. Pointer fields distinguish omitted values from zero.
 type Settings struct {
-	RequestTimeout *time.Duration `yaml:"request_timeout"`
-	RetryMin       *time.Duration `yaml:"retry_min"`
-	RetryMax       *time.Duration `yaml:"retry_max"`
-	StateDir       *string        `yaml:"state_dir"`
-	LogDir         *string        `yaml:"log_dir"`
-	Shape          *string        `yaml:"shape"`
-	OCPUs          *int           `yaml:"ocpus"`
-	MemoryGB       *int           `yaml:"memory_gb"`
-	BootVolumeGB   *int           `yaml:"boot_volume_gb"`
-	PublicIP       *bool          `yaml:"public_ip"`
-	Policy         PolicySettings `yaml:"policy,omitempty"`
+	RequestTimeout *time.Duration       `yaml:"request_timeout"`
+	RetryMin       *time.Duration       `yaml:"retry_min"`
+	RetryMax       *time.Duration       `yaml:"retry_max"`
+	StateDir       *string              `yaml:"state_dir"`
+	LogDir         *string              `yaml:"log_dir"`
+	Shape          *string              `yaml:"shape"`
+	OCPUs          *int                 `yaml:"ocpus"`
+	MemoryGB       *int                 `yaml:"memory_gb"`
+	BootVolumeGB   *int                 `yaml:"boot_volume_gb"`
+	PublicIP       *bool                `yaml:"public_ip"`
+	Policy         PolicySettings       `yaml:"policy,omitempty"`
+	Notifications  NotificationSettings `yaml:"notifications,omitempty"`
+}
+
+type NotificationSettings struct {
+	Enabled          *bool   `yaml:"enabled,omitempty"`
+	TelegramChat     *string `yaml:"telegram_chat_id,omitempty"`
+	TelegramTokenEnv *string `yaml:"telegram_token_env,omitempty"`
+}
+
+type Notifications struct {
+	Enabled          bool   `yaml:"enabled"`
+	TelegramChat     string `yaml:"telegram_chat_id,omitempty"`
+	TelegramTokenEnv string `yaml:"telegram_token_env,omitempty"`
 }
 
 // PolicySettings contains configurable provisioning safety limits.
@@ -126,6 +139,7 @@ type Effective struct {
 	BootVolumeGB      int           `yaml:"boot_volume_gb"`
 	PublicIP          bool          `yaml:"public_ip"`
 	Policy            Policy        `yaml:"policy"`
+	Notifications     Notifications `yaml:"notifications"`
 }
 
 // DefaultPath returns the OS-specific default project configuration path.
@@ -200,6 +214,12 @@ func (f File) Validate() error {
 }
 
 func validateSettings(scope string, s Settings) error {
+	if s.Notifications.TelegramChat != nil && strings.TrimSpace(*s.Notifications.TelegramChat) == "" {
+		return fmt.Errorf("%s.notifications.telegram_chat_id must not be blank", scope)
+	}
+	if s.Notifications.TelegramTokenEnv != nil && strings.TrimSpace(*s.Notifications.TelegramTokenEnv) == "" {
+		return fmt.Errorf("%s.notifications.telegram_token_env must not be blank", scope)
+	}
 	for name, value := range map[string]*time.Duration{"request_timeout": s.RequestTimeout, "retry_min": s.RetryMin, "retry_max": s.RetryMax} {
 		if value != nil && *value <= 0 {
 			return fmt.Errorf("%s.%s must be greater than zero", scope, name)
@@ -284,6 +304,9 @@ func (f File) Resolve(name string) (Effective, error) {
 	if e.RetryMin > e.RetryMax {
 		return Effective{}, fmt.Errorf("account %q retry_min must not exceed retry_max", name)
 	}
+	if e.Notifications.Enabled && (e.Notifications.TelegramChat == "" || e.Notifications.TelegramTokenEnv == "") {
+		return Effective{}, fmt.Errorf("account %q enabled notifications require telegram_chat_id and telegram_token_env", name)
+	}
 	return e, nil
 }
 
@@ -293,6 +316,15 @@ func Defaults(name string) (Effective, error) {
 }
 
 func apply(e *Effective, s Settings) {
+	if s.Notifications.Enabled != nil {
+		e.Notifications.Enabled = *s.Notifications.Enabled
+	}
+	if s.Notifications.TelegramChat != nil {
+		e.Notifications.TelegramChat = *s.Notifications.TelegramChat
+	}
+	if s.Notifications.TelegramTokenEnv != nil {
+		e.Notifications.TelegramTokenEnv = *s.Notifications.TelegramTokenEnv
+	}
 	if s.RequestTimeout != nil {
 		e.RequestTimeout = *s.RequestTimeout
 	}
@@ -428,6 +460,9 @@ func ApplyOverrides(e Effective, o Overrides) (Effective, error) {
 	}
 	if e.RetryMin > e.RetryMax {
 		return Effective{}, errors.New("retry_min must not exceed retry_max")
+	}
+	if e.Notifications.Enabled && (e.Notifications.TelegramChat == "" || e.Notifications.TelegramTokenEnv == "") {
+		return Effective{}, errors.New("enabled notifications require telegram_chat_id and telegram_token_env")
 	}
 	return e, nil
 }
