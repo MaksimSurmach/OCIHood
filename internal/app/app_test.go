@@ -357,7 +357,7 @@ func TestRunnerCapacityRaceReturnsToWatcher(t *testing.T) {
 	if err := os.WriteFile(sshKey, []byte("key"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir(), SSHPublicKeyPath: sshKey}
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir(), SSHPublicKeyPath: sshKey, Shape: "VM.Review.Flex", OCPUs: 7, MemoryGB: 19, BootVolumeGB: 123, Policy: config.Policy{AllowedShapes: []string{"VM.Review.Flex"}, MaxOCPUs: 7, MaxMemoryGB: 19, MaxBootGB: 123}}
 	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
 	watches, launches := 0, 0
 	var attempts []reconcile.Attempt
@@ -367,10 +367,13 @@ func TestRunnerCapacityRaceReturnsToWatcher(t *testing.T) {
 		watches++
 		return capacity.Result{Kind: capacity.Available, AvailabilityDomain: fmt.Sprintf("AD-%d", watches)}, nil
 	})
-	runner.SetLaunch(func(_ context.Context, _ provisioner.Bootstrapper, _ config.Effective, _ discovery.Result, decision reconcile.Decision, placement capacity.Result, _ string) (launch.Instance, error) {
+	runner.SetLaunch(func(_ context.Context, _ provisioner.Bootstrapper, got config.Effective, _ discovery.Result, decision reconcile.Decision, placement capacity.Result, _ string) (launch.Instance, error) {
 		launches++
 		if decision.Attempt == nil {
 			t.Fatal("launch lost logical attempt")
+		}
+		if got.Shape != "VM.Review.Flex" || got.OCPUs != 7 || got.MemoryGB != 19 || got.BootVolumeGB != 123 {
+			t.Fatalf("launch %d resources changed: %+v", launches, got)
 		}
 		attempts = append(attempts, *decision.Attempt)
 		if launches == 1 {
