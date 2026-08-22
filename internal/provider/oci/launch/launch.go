@@ -17,8 +17,38 @@ import (
 type computeClient interface {
 	LaunchInstance(context.Context, core.LaunchInstanceRequest) (core.LaunchInstanceResponse, error)
 	GetInstance(context.Context, core.GetInstanceRequest) (core.GetInstanceResponse, error)
+	ListInstances(context.Context, core.ListInstancesRequest) (core.ListInstancesResponse, error)
 	ListVnicAttachments(context.Context, core.ListVnicAttachmentsRequest) (core.ListVnicAttachmentsResponse, error)
 }
+
+func (p *Provider) Reconcile(ctx context.Context, in domain.Request) (domain.Instance, bool, error) {
+	var found []string
+	var page *string
+	for {
+		response, err := p.compute.ListInstances(ctx, core.ListInstancesRequest{CompartmentId: common.String(in.CompartmentID), Page: page})
+		if err != nil {
+			return domain.Instance{}, false, &domain.Error{Kind: classify(err), Err: err}
+		}
+		for _, instance := range response.Items {
+			if instance.LifecycleState != core.InstanceLifecycleStateTerminated && reconcile.IsOwned(instance.FreeformTags, in.TargetID, in.Account) {
+				found = append(found, value(instance.Id))
+			}
+		}
+		page = response.OpcNextPage
+		if page == nil {
+			break
+		}
+	}
+	if len(found) == 0 {
+		return domain.Instance{}, false, nil
+	}
+	if len(found) > 1 {
+		return domain.Instance{}, false, &domain.Error{Kind: domain.Fatal, Err: errors.New("multiple managed instances found while reconciling service limit")}
+	}
+	instance, err := p.Get(ctx, in.CompartmentID, found[0])
+	return instance, err == nil, err
+}
+
 type networkClient interface {
 	GetVnic(context.Context, core.GetVnicRequest) (core.GetVnicResponse, error)
 }

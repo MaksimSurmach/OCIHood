@@ -17,6 +17,13 @@ type fakeProvider struct {
 	getErrors      []error
 	launchRequests []Request
 	getCalls       int
+	reconciled     Instance
+	reconcileFound bool
+	reconcileErr   error
+}
+
+func (f *fakeProvider) Reconcile(context.Context, Request) (Instance, bool, error) {
+	return f.reconciled, f.reconcileFound, f.reconcileErr
 }
 
 func (f *fakeProvider) Launch(_ context.Context, r Request) (Result, error) {
@@ -140,6 +147,41 @@ func TestOrchestratorClassifiesAndCancels(t *testing.T) {
 			}
 		})
 	}
+	t.Run("service limit resumes reconciled instance", func(t *testing.T) {
+		provider := &fakeProvider{launches: []Result{{Kind: LimitExceeded}}, launchErrors: []error{errors.New("limit")}, reconciled: Instance{ID: "existing"}, reconcileFound: true, gets: []Instance{{State: "RUNNING", PublicIP: "203.0.113.1"}}}
+		store := &fakeStore{}
+		got, err := (Orchestrator{Provider: provider, Store: store, Sleeper: &fakeSleeper{}}).Run(t.Context(), validInput())
+		if err != nil || got.ID != "existing" || !reflect.DeepEqual(store.events, []string{"accepted", "running"}) {
+			t.Fatalf("got=%+v err=%v events=%v", got, err, store.events)
+		}
+	})
+	t.Run("expected public ip retries bounded lookup", func(t *testing.T) {
+		provider := &fakeProvider{gets: []Instance{{State: "RUNNING"}, {State: "RUNNING"}, {State: "RUNNING", PublicIP: "203.0.113.1"}}}
+		in := validInput()
+		in.ExistingInstanceID = "instance"
+		got, err := (Orchestrator{Provider: provider, Store: &fakeStore{}, Sleeper: &fakeSleeper{}}).Run(t.Context(), in)
+		if err != nil || got.PublicIP != "203.0.113.1" || provider.getCalls != 3 {
+			t.Fatalf("got=%+v err=%v getCalls=%d", got, err, provider.getCalls)
+		}
+	})
+	t.Run("disabled public ip does not retry lookup", func(t *testing.T) {
+		provider := &fakeProvider{gets: []Instance{{State: "RUNNING"}}}
+		in := validInput()
+		in.Request.PublicIP = false
+		in.ExistingInstanceID = "instance"
+		if _, err := (Orchestrator{Provider: provider, Store: &fakeStore{}, Sleeper: &fakeSleeper{}}).Run(t.Context(), in); err != nil || provider.getCalls != 1 {
+			t.Fatalf("err=%v getCalls=%d", err, provider.getCalls)
+		}
+	})
+	t.Run("missing public ip degrades after bounded lookup", func(t *testing.T) {
+		provider := &fakeProvider{gets: []Instance{{State: "RUNNING"}, {State: "RUNNING"}, {State: "RUNNING"}, {State: "RUNNING"}}}
+		in := validInput()
+		in.ExistingInstanceID = "instance"
+		got, err := (Orchestrator{Provider: provider, Store: &fakeStore{}, Sleeper: &fakeSleeper{}}).Run(t.Context(), in)
+		if err != nil || got.State != "RUNNING" || got.PublicIP != "" || provider.getCalls != 4 {
+			t.Fatalf("got=%+v err=%v getCalls=%d", got, err, provider.getCalls)
+		}
+	})
 	t.Run("terminal lifecycle", func(t *testing.T) {
 		store := &fakeStore{}
 		provider := &fakeProvider{gets: []Instance{{State: "TERMINATED"}}}

@@ -39,6 +39,7 @@ type Result struct {
 
 type Provider interface {
 	Launch(context.Context, Request) (Result, error)
+	Reconcile(context.Context, Request) (Instance, bool, error)
 	Get(context.Context, string, string) (Instance, error)
 }
 
@@ -91,7 +92,26 @@ func (o Orchestrator) Run(ctx context.Context, in Input) (Instance, error) {
 			}
 		case OutOfCapacity:
 			return Instance{}, &Error{Kind: OutOfCapacity, Err: err}
-		case Fatal, LimitExceeded:
+		case LimitExceeded:
+			requestCtx, cancel := context.WithTimeout(ctx, in.RequestTimeout)
+			instance, found, reconcileErr := o.Provider.Reconcile(requestCtx, in.Request)
+			cancel()
+			if ctx.Err() != nil {
+				return Instance{}, ctx.Err()
+			}
+			if reconcileErr != nil {
+				return Instance{}, fmt.Errorf("reconcile service limit: %w", reconcileErr)
+			}
+			if found {
+				instanceID = instance.ID
+				if err := o.Store.Accepted(instanceID); err != nil {
+					return Instance{}, fmt.Errorf("persist reconciled instance: %w", err)
+				}
+				break
+			}
+			_ = o.Store.Failed(err)
+			return Instance{}, &Error{Kind: LimitExceeded, Err: err}
+		case Fatal:
 			_ = o.Store.Failed(err)
 			return Instance{}, &Error{Kind: result.Kind, Err: err}
 		case Canceled:
@@ -127,6 +147,29 @@ func (o Orchestrator) Run(ctx context.Context, in Input) (Instance, error) {
 		}
 		switch instance.State {
 		case "RUNNING":
+			if in.Request.PublicIP && instance.PublicIP == "" {
+				for retry := 0; ; retry++ {
+					delay := backoff(in.RetryMin, in.RetryMax, retry)
+					if sleepErr := o.Sleeper.Sleep(ctx, delay); sleepErr != nil {
+						return Instance{}, sleepErr
+					}
+					requestCtx, cancel := context.WithTimeout(ctx, in.RequestTimeout)
+					lookedUp, lookupErr := o.Provider.Get(requestCtx, in.Request.CompartmentID, instanceID)
+					cancel()
+					if ctx.Err() != nil {
+						return Instance{}, ctx.Err()
+					}
+					if lookupErr == nil {
+						instance = lookedUp
+						if instance.PublicIP != "" {
+							break
+						}
+					}
+					if delay == in.RetryMax {
+						break
+					}
+				}
+			}
 			if err := o.Store.Finished(instance); err != nil {
 				return Instance{}, fmt.Errorf("persist running instance: %w", err)
 			}
