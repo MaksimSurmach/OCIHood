@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/capacity"
@@ -40,6 +41,7 @@ type Result struct {
 	InstanceID         string
 	InstanceState      string
 	PublicIP           string
+	Policy             config.PolicyDecision
 }
 
 // Plan is the deterministic, read-only provisioning intent.
@@ -52,6 +54,7 @@ type Plan struct {
 	Instances                                []reconcile.Instance
 	Action                                   reconcile.DecisionKind
 	Reason                                   string
+	Policy                                   config.PolicyDecision
 }
 
 // Error identifies the application phase that failed.
@@ -118,6 +121,11 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	policy := config.EvaluatePolicy(effective)
+	baseResult := Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Policy: policy}
+	if !policy.Allowed {
+		return baseResult, &Error{Phase: "policy", Err: fmt.Errorf("resource policy rejected: %s", strings.Join(policy.Violations, "; "))}
+	}
 	if r.launchInstance != nil {
 		guard, lockErr := state.New(effective.StateDir).TryRunLock(effective.Account, discovered.TargetID)
 		if lockErr != nil {
@@ -178,7 +186,10 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if instanceID == "" {
 		instanceID = decision.InstanceID
 	}
-	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain, InstanceID: instanceID, InstanceState: instance.State, PublicIP: instance.PublicIP}, nil
+	baseResult.Decision, baseResult.Attempt = decision.Kind, decision.Attempt
+	baseResult.Capacity, baseResult.AvailabilityDomain = capacityResult.Kind, capacityResult.AvailabilityDomain
+	baseResult.InstanceID, baseResult.InstanceState, baseResult.PublicIP = instanceID, instance.State, instance.PublicIP
+	return baseResult, nil
 }
 
 // Plan performs the same bounded configuration, authentication, bootstrap, and discovery path as Run without writes.
@@ -190,6 +201,7 @@ func (r *Runner) Plan(ctx context.Context, request Request) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
+	policy := config.EvaluatePolicy(effective)
 	value, err := state.New(effective.StateDir).Load(effective.Account, discovered.TargetID)
 	var local *reconcile.State
 	if err == nil {
@@ -210,6 +222,7 @@ func (r *Runner) Plan(ctx context.Context, request Request) (Plan, error) {
 		OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, BootVolumeGB: effective.BootVolumeGB, PublicIP: effective.PublicIP,
 		AvailabilityDomains: append([]string(nil), discovered.AvailabilityDomains...), Instances: managed,
 		Action: decision.Kind, Reason: decision.Reason,
+		Policy: policy,
 	}, nil
 }
 

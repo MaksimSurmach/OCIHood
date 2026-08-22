@@ -111,6 +111,70 @@ func TestPlanIsDeterministicAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestRunnerPolicyRejectsBeforeMutation(t *testing.T) {
+	t.Parallel()
+	base := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir(), Shape: "shape", OCPUs: 2, MemoryGB: 8, BootVolumeGB: 50, Policy: config.Policy{AllowedShapes: []string{"shape"}, MaxOCPUs: 2, MaxMemoryGB: 8, MaxBootGB: 50}}
+	tests := []struct {
+		name string
+		edit func(*config.Effective)
+		want string
+	}{
+		{name: "shape", edit: func(e *config.Effective) { e.Shape = "other" }, want: "shape"},
+		{name: "ocpus", edit: func(e *config.Effective) { e.OCPUs++ }, want: "ocpus"},
+		{name: "memory", edit: func(e *config.Effective) { e.MemoryGB++ }, want: "memory_gb"},
+		{name: "boot volume", edit: func(e *config.Effective) { e.BootVolumeGB++ }, want: "boot_volume_gb"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			effective := base
+			effective.StateDir = t.TempDir()
+			tt.edit(&effective)
+			provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
+			watches, launches := 0, 0
+			runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+				return discovery.Result{TargetID: "target"}, nil
+			}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, bool) (capacity.Result, error) {
+				watches++
+				provider.Create()
+				return capacity.Result{}, nil
+			})
+			runner.SetLaunch(func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, reconcile.Decision, capacity.Result, string) (launch.Instance, error) {
+				launches++
+				provider.Update()
+				return launch.Instance{}, nil
+			})
+			result, err := runner.Run(t.Context(), Request{Account: "personal"})
+			if err == nil || !strings.Contains(err.Error(), tt.want) || result.Policy.Allowed || len(result.Policy.Violations) != 1 || watches != 0 || launches != 0 || provider.mutationCalls() != 0 {
+				t.Fatalf("result=%+v err=%v watches=%d launches=%d mutations=%d", result, err, watches, launches, provider.mutationCalls())
+			}
+		})
+	}
+}
+
+func TestRunnerPolicyOverrideProceedsUnchanged(t *testing.T) {
+	t.Parallel()
+	key := filepath.Join(t.TempDir(), "id.pub")
+	if err := os.WriteFile(key, []byte("key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir(), SSHPublicKeyPath: key, Shape: "large", OCPUs: 8, MemoryGB: 32, BootVolumeGB: 200, Policy: config.Policy{AllowedShapes: []string{"small"}, MaxOCPUs: 2, MaxMemoryGB: 8, MaxBootGB: 50, AllowExceed: true}}
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+		return &fakeBootstrapper{run: func(context.Context) error { return nil }}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	})
+	runner.SetLaunch(func(_ context.Context, _ provisioner.Bootstrapper, got config.Effective, _ discovery.Result, _ reconcile.Decision, _ capacity.Result, _ string) (launch.Instance, error) {
+		if got.Shape != "large" || got.OCPUs != 8 || got.MemoryGB != 32 || got.BootVolumeGB != 200 {
+			t.Fatalf("resources changed: %+v", got)
+		}
+		return launch.Instance{ID: "instance", State: "RUNNING"}, nil
+	})
+	result, err := runner.Run(t.Context(), Request{Account: "personal"})
+	if err != nil || !result.Policy.Allowed || !result.Policy.Overridden || result.InstanceID != "instance" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
 func TestRunAlreadySatisfiedPreservesInstanceID(t *testing.T) {
 	t.Parallel()
 	effective := config.Effective{Account: "personal", Region: "region", StateDir: t.TempDir()}

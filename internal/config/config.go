@@ -25,6 +25,8 @@ const (
 	defaultRetryMax = 15 * time.Minute
 )
 
+var defaultAllowedShapes = []string{defaultShape}
+
 // File is the project configuration stored in YAML.
 type File struct {
 	Defaults Settings           `yaml:"defaults"`
@@ -43,6 +45,32 @@ type Settings struct {
 	MemoryGB       *int           `yaml:"memory_gb"`
 	BootVolumeGB   *int           `yaml:"boot_volume_gb"`
 	PublicIP       *bool          `yaml:"public_ip"`
+	Policy         PolicySettings `yaml:"policy,omitempty"`
+}
+
+// PolicySettings contains configurable provisioning safety limits.
+type PolicySettings struct {
+	AllowedShapes *[]string `yaml:"allowed_shapes,omitempty"`
+	MaxOCPUs      *int      `yaml:"max_ocpus,omitempty"`
+	MaxMemoryGB   *int      `yaml:"max_memory_gb,omitempty"`
+	MaxBootGB     *int      `yaml:"max_boot_volume_gb,omitempty"`
+	AllowExceed   *bool     `yaml:"allow_exceed,omitempty"`
+}
+
+// Policy is the resolved provisioning safety policy.
+type Policy struct {
+	AllowedShapes []string `yaml:"allowed_shapes" json:"allowed_shapes"`
+	MaxOCPUs      int      `yaml:"max_ocpus" json:"max_ocpus"`
+	MaxMemoryGB   int      `yaml:"max_memory_gb" json:"max_memory_gb"`
+	MaxBootGB     int      `yaml:"max_boot_volume_gb" json:"max_boot_volume_gb"`
+	AllowExceed   bool     `yaml:"allow_exceed" json:"allow_exceed"`
+}
+
+// PolicyDecision is a sanitized decision for resolved resource values.
+type PolicyDecision struct {
+	Allowed    bool     `json:"allowed"`
+	Overridden bool     `json:"overridden"`
+	Violations []string `json:"violations,omitempty"`
 }
 
 // Overrides contains explicitly set CLI values. Pointer fields preserve explicit zero and false values.
@@ -97,6 +125,7 @@ type Effective struct {
 	MemoryGB          int           `yaml:"memory_gb"`
 	BootVolumeGB      int           `yaml:"boot_volume_gb"`
 	PublicIP          bool          `yaml:"public_ip"`
+	Policy            Policy        `yaml:"policy"`
 }
 
 // DefaultPath returns the OS-specific default project configuration path.
@@ -189,6 +218,26 @@ func validateSettings(scope string, s Settings) error {
 			return fmt.Errorf("%s.%s must not be empty", scope, name)
 		}
 	}
+	if shapes := s.Policy.AllowedShapes; shapes != nil {
+		if len(*shapes) == 0 {
+			return fmt.Errorf("%s.policy.allowed_shapes must not be empty", scope)
+		}
+		seen := make(map[string]struct{}, len(*shapes))
+		for _, shape := range *shapes {
+			if strings.TrimSpace(shape) == "" {
+				return fmt.Errorf("%s.policy.allowed_shapes must not contain blank values", scope)
+			}
+			if _, ok := seen[shape]; ok {
+				return fmt.Errorf("%s.policy.allowed_shapes contains duplicate %q", scope, shape)
+			}
+			seen[shape] = struct{}{}
+		}
+	}
+	for name, value := range map[string]*int{"max_ocpus": s.Policy.MaxOCPUs, "max_memory_gb": s.Policy.MaxMemoryGB, "max_boot_volume_gb": s.Policy.MaxBootGB} {
+		if value != nil && *value <= 0 {
+			return fmt.Errorf("%s.policy.%s must be greater than zero", scope, name)
+		}
+	}
 	return nil
 }
 
@@ -211,6 +260,7 @@ func (f File) Resolve(name string) (Effective, error) {
 		RequestTimeout: defaultRequest, RetryMin: defaultRetryMin, RetryMax: defaultRetryMax,
 		StateDir: filepath.Join(configDir, "ocihood", "state"), LogDir: filepath.Join(configDir, "ocihood", "log"),
 		Shape: defaultShape, OCPUs: defaultOCPUs, MemoryGB: defaultMemoryGB, BootVolumeGB: defaultBootGB, PublicIP: true,
+		Policy: Policy{AllowedShapes: append([]string(nil), defaultAllowedShapes...), MaxOCPUs: defaultOCPUs, MaxMemoryGB: defaultMemoryGB, MaxBootGB: defaultBootGB},
 	}
 	apply(&e, f.Defaults)
 	apply(&e, account.Overrides)
@@ -273,6 +323,72 @@ func apply(e *Effective, s Settings) {
 	if s.PublicIP != nil {
 		e.PublicIP = *s.PublicIP
 	}
+	if s.Policy.AllowedShapes != nil {
+		e.Policy.AllowedShapes = append([]string(nil), (*s.Policy.AllowedShapes)...)
+	}
+	if s.Policy.MaxOCPUs != nil {
+		e.Policy.MaxOCPUs = *s.Policy.MaxOCPUs
+	}
+	if s.Policy.MaxMemoryGB != nil {
+		e.Policy.MaxMemoryGB = *s.Policy.MaxMemoryGB
+	}
+	if s.Policy.MaxBootGB != nil {
+		e.Policy.MaxBootGB = *s.Policy.MaxBootGB
+	}
+	if s.Policy.AllowExceed != nil {
+		e.Policy.AllowExceed = *s.Policy.AllowExceed
+	}
+}
+
+// EvaluatePolicy checks resolved resources without reading secrets or contacting OCI.
+func EvaluatePolicy(e Effective) PolicyDecision {
+	p := e.Policy
+	requestedShape, ocpus, memory, boot := e.Shape, e.OCPUs, e.MemoryGB, e.BootVolumeGB
+	if requestedShape == "" {
+		requestedShape = defaultShape
+	}
+	if ocpus == 0 {
+		ocpus = defaultOCPUs
+	}
+	if memory == 0 {
+		memory = defaultMemoryGB
+	}
+	if boot == 0 {
+		boot = defaultBootGB
+	}
+	if len(p.AllowedShapes) == 0 {
+		p.AllowedShapes = defaultAllowedShapes
+	}
+	if p.MaxOCPUs == 0 {
+		p.MaxOCPUs = defaultOCPUs
+	}
+	if p.MaxMemoryGB == 0 {
+		p.MaxMemoryGB = defaultMemoryGB
+	}
+	if p.MaxBootGB == 0 {
+		p.MaxBootGB = defaultBootGB
+	}
+	allowedShape := false
+	for _, allowed := range p.AllowedShapes {
+		if requestedShape == allowed {
+			allowedShape = true
+			break
+		}
+	}
+	var violations []string
+	if !allowedShape {
+		violations = append(violations, fmt.Sprintf("shape %q is not allowed", requestedShape))
+	}
+	if ocpus > p.MaxOCPUs {
+		violations = append(violations, fmt.Sprintf("ocpus %d exceeds maximum %d", ocpus, p.MaxOCPUs))
+	}
+	if memory > p.MaxMemoryGB {
+		violations = append(violations, fmt.Sprintf("memory_gb %d exceeds maximum %d", memory, p.MaxMemoryGB))
+	}
+	if boot > p.MaxBootGB {
+		violations = append(violations, fmt.Sprintf("boot_volume_gb %d exceeds maximum %d", boot, p.MaxBootGB))
+	}
+	return PolicyDecision{Allowed: len(violations) == 0 || p.AllowExceed, Overridden: len(violations) > 0 && p.AllowExceed, Violations: violations}
 }
 
 // ApplyOverrides applies explicitly set CLI values and validates the resulting configuration.

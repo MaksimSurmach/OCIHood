@@ -110,7 +110,7 @@ func newRootCommand(runner Runner) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("plan provisioning run: %w", err)
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "account: %s\ntarget_id: %s\nregion: %s\ncompartment_id: %s\nshape: %s\nocpus: %d\nmemory_gb: %d\nimage_id: %s\nvcn_id: %s\nsubnet_id: %s\nboot_volume_gb: %d\npublic_ip: %t\navailability_domains: %s\nmanaged_instances: %s\naction: %s\nreason: %s\n", result.Account, result.TargetID, result.Region, result.CompartmentID, result.Shape, result.OCPUs, result.MemoryGB, result.ImageID, result.VCNID, result.SubnetID, result.BootVolumeGB, result.PublicIP, strings.Join(result.AvailabilityDomains, ","), renderInstances(result.Instances), renderAction(result.Action), result.Reason)
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "account: %s\ntarget_id: %s\nregion: %s\ncompartment_id: %s\nshape: %s\nocpus: %d\nmemory_gb: %d\nimage_id: %s\nvcn_id: %s\nsubnet_id: %s\nboot_volume_gb: %d\npublic_ip: %t\npolicy_decision: %s\npolicy_violations: %s\navailability_domains: %s\nmanaged_instances: %s\naction: %s\nreason: %s\n", result.Account, result.TargetID, result.Region, result.CompartmentID, result.Shape, result.OCPUs, result.MemoryGB, result.ImageID, result.VCNID, result.SubnetID, result.BootVolumeGB, result.PublicIP, renderPolicy(result.Policy), strings.Join(result.Policy.Violations, "; "), strings.Join(result.AvailabilityDomains, ","), renderInstances(result.Instances), renderAction(result.Action), result.Reason)
 			return err
 		},
 	}
@@ -127,14 +127,15 @@ func newRootCommand(runner Runner) *cobra.Command {
 const resultSchema = "ocihood.start/v1"
 
 type commandDocument struct {
-	Schema        string `json:"schema"`
-	Account       string `json:"account"`
-	TargetID      string `json:"target_id,omitempty"`
-	Outcome       string `json:"outcome"`
-	Region        string `json:"region,omitempty"`
-	InstanceID    string `json:"instance_id,omitempty"`
-	InstanceState string `json:"instance_state,omitempty"`
-	PublicIP      string `json:"public_ip,omitempty"`
+	Schema        string                 `json:"schema"`
+	Account       string                 `json:"account"`
+	TargetID      string                 `json:"target_id,omitempty"`
+	Outcome       string                 `json:"outcome"`
+	Region        string                 `json:"region,omitempty"`
+	InstanceID    string                 `json:"instance_id,omitempty"`
+	InstanceState string                 `json:"instance_state,omitempty"`
+	PublicIP      string                 `json:"public_ip,omitempty"`
+	Policy        *config.PolicyDecision `json:"policy,omitempty"`
 	Error         struct {
 		Category string `json:"category,omitempty"`
 		Message  string `json:"message,omitempty"`
@@ -198,6 +199,9 @@ func (v executionValues) write(out io.Writer, result commandDocument) error {
 
 func commandResult(account string, result app.Result, err error) (commandDocument, int) {
 	doc := commandDocument{Schema: resultSchema, Account: account, TargetID: result.TargetID, Outcome: "success", Region: result.Region, InstanceID: result.InstanceID, InstanceState: result.InstanceState, PublicIP: result.PublicIP}
+	if result.Policy.Allowed || result.Policy.Overridden || len(result.Policy.Violations) > 0 {
+		doc.Policy = &result.Policy
+	}
 	if err == nil {
 		if result.Decision == reconcile.DecisionAlreadySatisfied {
 			doc.Outcome = "already_satisfied"
@@ -227,6 +231,16 @@ func commandResult(account string, result app.Result, err error) (commandDocumen
 		}
 	}
 	return doc, code
+}
+
+func renderPolicy(decision config.PolicyDecision) string {
+	if decision.Overridden {
+		return "override-allowed"
+	}
+	if decision.Allowed {
+		return "within-policy"
+	}
+	return "rejected"
 }
 
 func renderAction(kind reconcile.DecisionKind) string {
