@@ -7,14 +7,18 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
+	"github.com/MaksimSurmach/OCIHood/internal/capacity"
 	"github.com/MaksimSurmach/OCIHood/internal/cli"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provider/oci/auth"
+	ocicapacity "github.com/MaksimSurmach/OCIHood/internal/provider/oci/capacity"
 	ocidiscovery "github.com/MaksimSurmach/OCIHood/internal/provider/oci/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
+	"github.com/MaksimSurmach/OCIHood/internal/state"
 )
 
 func main() {
@@ -44,6 +48,23 @@ func main() {
 			OSVersion: effective.OSVersion, VCNID: effective.VCNID, VCNName: effective.VCNName,
 			SubnetID: effective.SubnetID, SubnetName: effective.SubnetName, PublicIP: effective.PublicIP,
 		})
+	}, func(ctx context.Context, bootstrapper provisioner.Bootstrapper, effective config.Effective, discovered discovery.Result) (capacity.Result, error) {
+		clients, ok := bootstrapper.(*auth.Clients)
+		if !ok {
+			return capacity.Result{}, fmt.Errorf("authenticated provider has unsupported type %T", bootstrapper)
+		}
+		store := capacity.StateStore{Store: state.New(effective.StateDir), Account: effective.Account, Now: time.Now}
+		resume, err := store.Load(discovered.TargetID)
+		if err != nil {
+			return capacity.Result{}, err
+		}
+		for index, ad := range discovered.AvailabilityDomains {
+			if ad == resume.LastAD {
+				resume.NextAD = (index + 1) % len(discovered.AvailabilityDomains)
+			}
+		}
+		watcher := capacity.Watcher{Client: ocicapacity.New(clients), Store: store, Sleeper: capacity.TimerSleeper{}, Random: capacity.CryptoRandom{}, Logger: logger, Now: time.Now, Config: capacity.Config{RequestTimeout: effective.RequestTimeout, InitialInterval: effective.RetryMin, MaxInterval: effective.RetryMax, Jitter: .2}}
+		return watcher.Watch(ctx, capacity.Input{TargetID: discovered.TargetID, TenancyID: discovered.TenancyID, Shape: effective.Shape, AvailabilityDomains: discovered.AvailabilityDomains, OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, Resume: resume})
 	})
 	exitCode := cli.Execute(ctx, os.Args[1:], runner, os.Stdout, os.Stderr)
 	stop()

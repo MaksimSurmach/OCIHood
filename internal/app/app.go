@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/MaksimSurmach/OCIHood/internal/capacity"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
 	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provisioner"
@@ -24,11 +25,13 @@ type Request struct {
 
 // Result describes the completed read-only discovery and reconciliation decision.
 type Result struct {
-	Account  string
-	Region   string
-	TargetID string
-	Decision reconcile.DecisionKind
-	Attempt  *reconcile.Attempt
+	Account            string
+	Region             string
+	TargetID           string
+	Decision           reconcile.DecisionKind
+	Attempt            *reconcile.Attempt
+	Capacity           capacity.Kind
+	AvailabilityDomain string
 }
 
 // Error identifies the application phase that failed.
@@ -49,19 +52,27 @@ type Authenticate func(context.Context, config.Effective) (provisioner.Bootstrap
 // Discover performs the bounded read-only resource discovery used before reconciliation.
 type Discover func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error)
 
+// WatchCapacity waits for advisory capacity after a create-safe reconciliation decision.
+type WatchCapacity func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result) (capacity.Result, error)
+
 // Runner coordinates configuration, authentication, and provisioning.
 type Runner struct {
-	logger       *slog.Logger
-	load         Load
-	authenticate Authenticate
-	discover     Discover
-	random       io.Reader
-	now          func() time.Time
+	logger        *slog.Logger
+	load          Load
+	authenticate  Authenticate
+	discover      Discover
+	watchCapacity WatchCapacity
+	random        io.Reader
+	now           func() time.Time
 }
 
 // NewRunner creates the application runner.
-func NewRunner(logger *slog.Logger, load Load, authenticate Authenticate, discover Discover) *Runner {
-	return &Runner{logger: logger, load: load, authenticate: authenticate, discover: discover, random: rand.Reader, now: time.Now}
+func NewRunner(logger *slog.Logger, load Load, authenticate Authenticate, discover Discover, watchCapacity ...WatchCapacity) *Runner {
+	runner := &Runner{logger: logger, load: load, authenticate: authenticate, discover: discover, random: rand.Reader, now: time.Now}
+	if len(watchCapacity) > 0 {
+		runner.watchCapacity = watchCapacity[0]
+	}
+	return runner
 }
 
 // Run performs one authenticated, read-only bootstrap run.
@@ -111,9 +122,17 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "state")
 		return Result{}, &Error{Phase: "state", Err: err}
 	}
+	var capacityResult capacity.Result
+	if r.watchCapacity != nil && (decision.Kind == reconcile.DecisionCreate || decision.Kind == reconcile.DecisionNewAttemptSafe || decision.Kind == reconcile.DecisionRetrySameAttempt) {
+		capacityResult, err = r.watchCapacity(ctx, provider, effective, discovered)
+		if err != nil {
+			r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "capacity")
+			return Result{}, &Error{Phase: "capacity", Err: err}
+		}
+	}
 
 	r.logger.InfoContext(ctx, "provisioning run completed", "account", request.Account, "region", effective.Region)
-	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt}, nil
+	return Result{Account: request.Account, Region: effective.Region, TargetID: discovered.TargetID, Decision: decision.Kind, Attempt: decision.Attempt, Capacity: capacityResult.Kind, AvailabilityDomain: capacityResult.AvailabilityDomain}, nil
 }
 
 const attemptValidity = 24 * time.Hour
