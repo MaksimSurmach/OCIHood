@@ -45,6 +45,14 @@ type Settings struct {
 	PublicIP       *bool          `yaml:"public_ip"`
 }
 
+// Overrides contains explicitly set CLI values. Pointer fields preserve explicit zero and false values.
+type Overrides struct {
+	OCIConfigPath, OCIProfile, Region, SSHPublicKeyPath, SSHPrivateKeyPath *string
+	CompartmentID, ImageID, OperatingSystem, OSVersion                     *string
+	VCNID, VCNName, SubnetID, SubnetName                                   *string
+	Settings                                                               Settings
+}
+
 // Account selects OCI credential references and optional runtime overrides.
 type Account struct {
 	OCIConfigPath     string   `yaml:"oci_config_path"`
@@ -229,6 +237,11 @@ func (f File) Resolve(name string) (Effective, error) {
 	return e, nil
 }
 
+// Defaults resolves built-in defaults for a configless named account.
+func Defaults(name string) (Effective, error) {
+	return (File{Accounts: map[string]Account{name: {}}}).Resolve(name)
+}
+
 func apply(e *Effective, s Settings) {
 	if s.RequestTimeout != nil {
 		e.RequestTimeout = *s.RequestTimeout
@@ -260,6 +273,47 @@ func apply(e *Effective, s Settings) {
 	if s.PublicIP != nil {
 		e.PublicIP = *s.PublicIP
 	}
+}
+
+// ApplyOverrides applies explicitly set CLI values and validates the resulting configuration.
+func ApplyOverrides(e Effective, o Overrides) (Effective, error) {
+	apply(&e, o.Settings)
+	if o.VCNID != nil && o.VCNName == nil {
+		e.VCNName = ""
+	}
+	if o.VCNName != nil && o.VCNID == nil {
+		e.VCNID = ""
+	}
+	if o.SubnetID != nil && o.SubnetName == nil {
+		e.SubnetName = ""
+	}
+	if o.SubnetName != nil && o.SubnetID == nil {
+		e.SubnetID = ""
+	}
+	for value, target := range map[*string]*string{
+		o.OCIConfigPath: &e.OCIConfigPath, o.OCIProfile: &e.OCIProfile, o.Region: &e.Region,
+		o.SSHPublicKeyPath: &e.SSHPublicKeyPath, o.SSHPrivateKeyPath: &e.SSHPrivateKeyPath,
+		o.CompartmentID: &e.CompartmentID, o.ImageID: &e.ImageID, o.OperatingSystem: &e.OperatingSystem,
+		o.OSVersion: &e.OSVersion, o.VCNID: &e.VCNID, o.VCNName: &e.VCNName,
+		o.SubnetID: &e.SubnetID, o.SubnetName: &e.SubnetName,
+	} {
+		if value != nil {
+			*target = *value
+		}
+	}
+	if err := validateSettings("CLI overrides", o.Settings); err != nil {
+		return Effective{}, err
+	}
+	if e.VCNID != "" && e.VCNName != "" {
+		return Effective{}, errors.New("vcn_id and vcn_name are mutually exclusive")
+	}
+	if e.SubnetID != "" && e.SubnetName != "" {
+		return Effective{}, errors.New("subnet_id and subnet_name are mutually exclusive")
+	}
+	if e.RetryMin > e.RetryMax {
+		return Effective{}, errors.New("retry_min must not exceed retry_max")
+	}
+	return e, nil
 }
 
 // MarshalEffective returns deterministic YAML containing references, never referenced file contents.

@@ -23,6 +23,8 @@ import (
 type Request struct {
 	ConfigPath string
 	Account    string
+	Overrides  config.Overrides
+	Configless bool
 }
 
 // Result describes the completed read-only discovery and reconciliation decision.
@@ -94,10 +96,23 @@ func (r *Runner) Run(ctx context.Context, request Request) (Result, error) {
 	}
 	r.logger.InfoContext(ctx, "provisioning run started", "account", request.Account)
 
-	effective, err := r.load(ctx, request.ConfigPath, request.Account)
+	var effective config.Effective
+	var err error
+	if request.Configless {
+		effective, err = config.Defaults(request.Account)
+	} else {
+		effective, err = r.load(ctx, request.ConfigPath, request.Account)
+	}
 	if err != nil {
 		r.logger.ErrorContext(ctx, "provisioning run failed", "account", request.Account, "phase", "config")
 		return Result{}, &Error{Phase: "config", Err: err}
+	}
+	effective, err = config.ApplyOverrides(effective, request.Overrides)
+	if err != nil {
+		return Result{}, &Error{Phase: "config", Err: err}
+	}
+	if request.Configless && effective.SSHPublicKeyPath == "" {
+		return Result{}, &Error{Phase: "config", Err: errors.New("--ssh-public-key is required without a configuration file")}
 	}
 	if err := ctx.Err(); err != nil {
 		return Result{}, &Error{Phase: "config", Err: err}

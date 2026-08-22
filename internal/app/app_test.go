@@ -26,6 +26,24 @@ type fakeBootstrapper struct {
 	run func(context.Context) error
 }
 
+func TestConfiglessMissingRequiredInputStopsBeforeProvider(t *testing.T) {
+	t.Parallel()
+	providerCalls := 0
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) {
+		t.Fatal("configless run must not load a file")
+		return config.Effective{}, nil
+	}, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) {
+		providerCalls++
+		return &fakeBootstrapper{}, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{}, nil
+	})
+	_, err := runner.Run(t.Context(), Request{Account: "personal", Configless: true})
+	if err == nil || !strings.Contains(err.Error(), "--ssh-public-key is required") || providerCalls != 0 {
+		t.Fatalf("Run() error = %v, provider calls = %d", err, providerCalls)
+	}
+}
+
 func TestRunnerRestartLoadsAttemptBeforeCreateDecision(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

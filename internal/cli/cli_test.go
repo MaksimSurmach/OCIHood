@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,77 @@ func TestStartCommandToProvisioner(t *testing.T) {
 	}
 	if provider.calls != 1 {
 		t.Fatalf("provider calls = %d, want 1", provider.calls)
+	}
+}
+
+func TestConfiglessFlagsReachSameEffectiveConfigAsFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	stateDir := filepath.Join(dir, "state")
+	body := "defaults:\n  state_dir: " + stateDir + "\naccounts:\n  personal:\n    oci_profile: TEST\n    region: eu-zurich-1\n    ssh_public_key_path: /keys/test.pub\n    compartment_id: compartment\n    image_id: image\n    subnet_id: subnet\n    overrides:\n      public_ip: false\n"
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var effective []config.Effective
+	provider := &integrationBootstrapper{}
+	runner := app.NewRunner(slog.Default(), func(_ context.Context, path, account string) (config.Effective, error) {
+		cfg, err := config.Load(path)
+		if err != nil {
+			return config.Effective{}, err
+		}
+		return cfg.Resolve(account)
+	}, func(_ context.Context, got config.Effective) (provisioner.Bootstrapper, error) {
+		effective = append(effective, got)
+		return provider, nil
+	}, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		return discovery.Result{TargetID: "target"}, nil
+	})
+
+	commands := [][]string{
+		{"--config", configPath, "start", "--account", "personal"},
+		{"start", "--account", "personal", "--oci-profile", "TEST", "--region", "eu-zurich-1", "--ssh-public-key", "/keys/test.pub", "--compartment-id", "compartment", "--image-id", "image", "--subnet-id", "subnet", "--state-dir", stateDir, "--public-ip=false"},
+	}
+	for _, args := range commands {
+		var stdout, stderr bytes.Buffer
+		if code := Execute(t.Context(), args, runner, &stdout, &stderr); code != 0 {
+			t.Fatalf("Execute(%v) = %d, stderr %q", args, code, stderr.String())
+		}
+	}
+	if len(effective) != 2 || !reflect.DeepEqual(effective[0], effective[1]) {
+		t.Fatalf("effective configs differ: %#v / %#v", effective[0], effective[1])
+	}
+}
+
+func TestConfiglessValidationAndHelp(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{}
+	var stdout, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"start", "--help"}, runner, &stdout, &stderr); code != 0 {
+		t.Fatal(stderr.String())
+	}
+	for _, want := range []string{"--public-ip", "--ssh-public-key", "Explicit flags override", "ocihood start --account"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("help missing %q: %s", want, stdout.String())
+		}
+	}
+}
+
+func TestConfigShowAcceptsConfiglessOverridesWithoutReadingReferences(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	key := filepath.Join(dir, "private-key")
+	secret := "SECRET-KEY-CONTENTS"
+	if err := os.WriteFile(key, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	args := []string{"config", "show", "--account", "personal", "--ssh-private-key", key, "--ssh-public-key", "/key.pub", "--public-ip=false"}
+	if code := Execute(t.Context(), args, &fakeRunner{}, &stdout, &stderr); code != 0 {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), secret) || !strings.Contains(stdout.String(), "public_ip: false") || !strings.Contains(stdout.String(), key) {
+		t.Fatalf("unsafe or incomplete output: %q", stdout.String())
 	}
 }
 
