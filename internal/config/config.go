@@ -15,14 +15,18 @@ import (
 )
 
 const (
-	defaultProfile  = "DEFAULT"
-	defaultShape    = "VM.Standard.A1.Flex"
-	defaultOCPUs    = 2
-	defaultMemoryGB = 12
-	defaultBootGB   = 50
-	defaultRequest  = 30 * time.Second
-	defaultRetryMin = 30 * time.Second
-	defaultRetryMax = 15 * time.Minute
+	defaultProfile         = "DEFAULT"
+	defaultShape           = "VM.Standard.A1.Flex"
+	defaultOCPUs           = 2
+	defaultMemoryGB        = 12
+	defaultBootGB          = 50
+	defaultRequest         = 30 * time.Second
+	defaultRetryMin        = 30 * time.Second
+	defaultRetryMax        = 15 * time.Minute
+	defaultBreakerFailures = 5
+	defaultBreakerHalfOpen = 1
+	defaultBreakerInterval = 5 * time.Minute
+	defaultBreakerTimeout  = time.Minute
 )
 
 var defaultAllowedShapes = []string{defaultShape}
@@ -47,6 +51,19 @@ type Settings struct {
 	PublicIP       *bool                `yaml:"public_ip"`
 	Policy         PolicySettings       `yaml:"policy,omitempty"`
 	Notifications  NotificationSettings `yaml:"notifications,omitempty"`
+	Breaker        BreakerSettings      `yaml:"circuit_breaker,omitempty"`
+}
+
+type BreakerSettings struct {
+	Failures         *int           `yaml:"failures,omitempty"`
+	HalfOpenRequests *int           `yaml:"half_open_requests,omitempty"`
+	Interval         *time.Duration `yaml:"interval,omitempty"`
+	OpenTimeout      *time.Duration `yaml:"open_timeout,omitempty"`
+}
+
+type Breaker struct {
+	Failures, HalfOpenRequests int
+	Interval, OpenTimeout      time.Duration
 }
 
 type NotificationSettings struct {
@@ -140,6 +157,7 @@ type Effective struct {
 	PublicIP          bool          `yaml:"public_ip"`
 	Policy            Policy        `yaml:"policy"`
 	Notifications     Notifications `yaml:"notifications"`
+	Breaker           Breaker       `yaml:"circuit_breaker"`
 }
 
 // DefaultPath returns the OS-specific default project configuration path.
@@ -214,6 +232,16 @@ func (f File) Validate() error {
 }
 
 func validateSettings(scope string, s Settings) error {
+	for name, value := range map[string]*int{"circuit_breaker.failures": s.Breaker.Failures, "circuit_breaker.half_open_requests": s.Breaker.HalfOpenRequests} {
+		if value != nil && (*value < 1 || name == "circuit_breaker.failures" && *value > 100 || name == "circuit_breaker.half_open_requests" && *value > 10) {
+			return fmt.Errorf("%s.%s is outside its safe range", scope, name)
+		}
+	}
+	for name, value := range map[string]*time.Duration{"circuit_breaker.interval": s.Breaker.Interval, "circuit_breaker.open_timeout": s.Breaker.OpenTimeout} {
+		if value != nil && (*value < time.Second || name == "circuit_breaker.interval" && *value > 24*time.Hour || name == "circuit_breaker.open_timeout" && *value > time.Hour) {
+			return fmt.Errorf("%s.%s is outside its safe range", scope, name)
+		}
+	}
 	if s.Notifications.TelegramChat != nil && strings.TrimSpace(*s.Notifications.TelegramChat) == "" {
 		return fmt.Errorf("%s.notifications.telegram_chat_id must not be blank", scope)
 	}
@@ -280,7 +308,8 @@ func (f File) Resolve(name string) (Effective, error) {
 		RequestTimeout: defaultRequest, RetryMin: defaultRetryMin, RetryMax: defaultRetryMax,
 		StateDir: filepath.Join(configDir, "ocihood", "state"), LogDir: filepath.Join(configDir, "ocihood", "log"),
 		Shape: defaultShape, OCPUs: defaultOCPUs, MemoryGB: defaultMemoryGB, BootVolumeGB: defaultBootGB, PublicIP: true,
-		Policy: Policy{AllowedShapes: append([]string(nil), defaultAllowedShapes...), MaxOCPUs: defaultOCPUs, MaxMemoryGB: defaultMemoryGB, MaxBootGB: defaultBootGB},
+		Policy:  Policy{AllowedShapes: append([]string(nil), defaultAllowedShapes...), MaxOCPUs: defaultOCPUs, MaxMemoryGB: defaultMemoryGB, MaxBootGB: defaultBootGB},
+		Breaker: Breaker{Failures: defaultBreakerFailures, HalfOpenRequests: defaultBreakerHalfOpen, Interval: defaultBreakerInterval, OpenTimeout: defaultBreakerTimeout},
 	}
 	apply(&e, f.Defaults)
 	apply(&e, account.Overrides)
@@ -316,6 +345,18 @@ func Defaults(name string) (Effective, error) {
 }
 
 func apply(e *Effective, s Settings) {
+	if s.Breaker.Failures != nil {
+		e.Breaker.Failures = *s.Breaker.Failures
+	}
+	if s.Breaker.HalfOpenRequests != nil {
+		e.Breaker.HalfOpenRequests = *s.Breaker.HalfOpenRequests
+	}
+	if s.Breaker.Interval != nil {
+		e.Breaker.Interval = *s.Breaker.Interval
+	}
+	if s.Breaker.OpenTimeout != nil {
+		e.Breaker.OpenTimeout = *s.Breaker.OpenTimeout
+	}
 	if s.Notifications.Enabled != nil {
 		e.Notifications.Enabled = *s.Notifications.Enabled
 	}

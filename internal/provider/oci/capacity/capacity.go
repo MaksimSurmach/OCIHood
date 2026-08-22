@@ -68,8 +68,11 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 }
 
 func classify(err error) (domain.ProbeResult, error) {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
 		return domain.ProbeResult{Kind: domain.Canceled}, err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return domain.ProbeResult{Kind: domain.Transient}, err
 	}
 	var service common.ServiceError
 	if errors.As(err, &service) {

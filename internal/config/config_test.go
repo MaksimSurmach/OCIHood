@@ -74,7 +74,7 @@ func TestBuiltInDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Shape != defaultShape || got.OCPUs != 2 || got.MemoryGB != 12 || got.BootVolumeGB != 50 || got.OCIProfile != "DEFAULT" || got.RequestTimeout != 30*time.Second || !reflect.DeepEqual(got.Policy.AllowedShapes, []string{defaultShape}) || got.Policy.MaxOCPUs != 2 || got.Policy.MaxMemoryGB != 12 || got.Policy.MaxBootGB != 50 {
+	if got.Shape != defaultShape || got.OCPUs != 2 || got.MemoryGB != 12 || got.BootVolumeGB != 50 || got.OCIProfile != "DEFAULT" || got.RequestTimeout != 30*time.Second || !reflect.DeepEqual(got.Policy.AllowedShapes, []string{defaultShape}) || got.Policy.MaxOCPUs != 2 || got.Policy.MaxMemoryGB != 12 || got.Policy.MaxBootGB != 50 || got.Breaker != (Breaker{Failures: 5, HalfOpenRequests: 1, Interval: 5 * time.Minute, OpenTimeout: time.Minute}) {
 		t.Fatalf("defaults = %#v", got)
 	}
 }
@@ -124,6 +124,9 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		{name: "cross layer retry bounds", body: "defaults:\n  retry_max: 1m\naccounts:\n  one:\n    overrides:\n      retry_min: 2m\n", want: "retry_min must not exceed retry_max"},
 		{name: "empty allowed shapes", body: "defaults:\n  policy:\n    allowed_shapes: []\n", want: "allowed_shapes must not be empty"},
 		{name: "invalid policy maximum", body: "defaults:\n  policy:\n    max_ocpus: 0\n", want: "max_ocpus must be greater than zero"},
+		{name: "zero breaker failures", body: "defaults:\n  circuit_breaker:\n    failures: 0\n", want: "circuit_breaker.failures is outside its safe range"},
+		{name: "excess half open probes", body: "defaults:\n  circuit_breaker:\n    half_open_requests: 11\n", want: "circuit_breaker.half_open_requests is outside its safe range"},
+		{name: "short breaker timeout", body: "defaults:\n  circuit_breaker:\n    open_timeout: 500ms\n", want: "circuit_breaker.open_timeout is outside its safe range"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -133,6 +136,29 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 				t.Fatalf("Load() error = %v, want substring %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestBreakerPrecedence(t *testing.T) {
+	t.Parallel()
+	cfg, err := Load(writeConfig(t, `
+defaults:
+  circuit_breaker:
+    failures: 8
+    interval: 10m
+accounts:
+  test:
+    overrides:
+      circuit_breaker:
+        failures: 3
+        open_timeout: 2m
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := cfg.Resolve("test")
+	if err != nil || got.Breaker != (Breaker{Failures: 3, HalfOpenRequests: 1, Interval: 10 * time.Minute, OpenTimeout: 2 * time.Minute}) {
+		t.Fatalf("breaker=%+v err=%v", got.Breaker, err)
 	}
 }
 
