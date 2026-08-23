@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -39,12 +40,12 @@ func (f *fakeRunner) Plan(_ context.Context, request app.Request) (app.Plan, err
 
 func TestPlanCommandRendersDeterministicIntent(t *testing.T) {
 	t.Parallel()
-	runner := &fakeRunner{plan: app.Plan{Account: "personal", TargetID: "target", Region: "region", CompartmentID: "compartment", Shape: "shape", OCPUs: 2, MemoryGB: 12, ImageID: "image", ImageName: "Ubuntu-24.04-aarch64", OperatingSystem: "Canonical Ubuntu", OSVersion: "24.04", VCNID: "vcn", SubnetID: "subnet", BootVolumeGB: 50, PublicIP: true, Policy: config.PolicyDecision{Violations: []string{"ocpus 2 exceeds maximum 1"}}, AvailabilityDomains: []string{"AD-1", "AD-2"}, Action: reconcile.DecisionCreate, Reason: "no active instance"}}
+	runner := &fakeRunner{plan: app.Plan{Account: "personal", TargetID: "target", Region: "region", CompartmentID: "compartment", Shape: "shape", ShapeArchitecture: "aarch64", OCPUs: 2, MemoryGB: 12, ImageID: "image", ImageName: "Ubuntu-24.04-aarch64", OperatingSystem: "Canonical Ubuntu", OSVersion: "24.04", VCNID: "vcn", SubnetID: "subnet", BootVolumeGB: 50, PublicIP: true, Policy: config.PolicyDecision{Violations: []string{"ocpus 2 exceeds maximum 1"}}, AvailabilityDomains: []string{"AD-1", "AD-2"}, Action: reconcile.DecisionCreate, Reason: "no active instance"}}
 	var stdout, stderr bytes.Buffer
 	if code := Execute(t.Context(), []string{"--config", "config.yaml", "plan", "--account", "personal"}, runner, &stdout, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
-	for _, want := range []string{"target_id: target", "image_name: Ubuntu-24.04-aarch64", "os_version: 24.04", "policy_decision: rejected", "policy_violations: ocpus 2 exceeds maximum 1", "availability_domains: AD-1,AD-2", "action: create", "reason: no active instance"} {
+	for _, want := range []string{"target_id: target", "shape_architecture: aarch64", "image_name: Ubuntu-24.04-aarch64", "os_version: 24.04", "policy_decision: rejected", "policy_violations: ocpus 2 exceeds maximum 1", "availability_domains: AD-1,AD-2", "action: create", "reason: no active instance"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("output missing %q: %s", want, stdout.String())
 		}
@@ -52,17 +53,40 @@ func TestPlanCommandRendersDeterministicIntent(t *testing.T) {
 }
 
 func TestPlanCommandRendersJSON(t *testing.T) {
-	runner := &fakeRunner{plan: app.Plan{Account: "personal", TargetID: "target", Shape: "VM.Standard.A1.Flex", OCPUs: 2, MemoryGB: 24, BootVolumeGB: 100, ImageID: "image", ImageName: "Ubuntu-24.04-aarch64", OperatingSystem: "Canonical Ubuntu", OSVersion: "24.04", Action: reconcile.DecisionCreate}}
-	var stdout, stderr bytes.Buffer
-	if code := Execute(t.Context(), []string{"plan", "--account", "personal", "--output=json"}, runner, &stdout, &stderr); code != 0 {
-		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	plan := app.Plan{Account: "personal", TargetID: "target", Shape: "VM.Standard.A1.Flex", ShapeArchitecture: "aarch64", OCPUs: 2, MemoryGB: 24, BootVolumeGB: 100, PublicIP: true, ImageID: "image", ImageName: "Ubuntu-24.04-aarch64", OperatingSystem: "Canonical Ubuntu", OSVersion: "24.04", Action: reconcile.DecisionCreate}
+	runner := &fakeRunner{plan: plan}
+	var textOutput, jsonOutput, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"plan", "--account", "personal"}, runner, &textOutput, &stderr); code != 0 {
+		t.Fatalf("text code=%d stderr=%q", code, stderr.String())
+	}
+	stderr.Reset()
+	if code := Execute(t.Context(), []string{"plan", "--account", "personal", "--output=json"}, runner, &jsonOutput, &stderr); code != 0 {
+		t.Fatalf("json code=%d stderr=%q", code, stderr.String())
 	}
 	var document planOutputDocument
-	if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
+	if err := json.Unmarshal(jsonOutput.Bytes(), &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Schema != planSchema || document.ImageName != "Ubuntu-24.04-aarch64" || document.OSVersion != "24.04" || document.MemoryGB != 24 || document.BootVolumeGB != 100 {
-		t.Fatalf("plan=%+v", document)
+	parity := map[string]string{
+		"shape": document.Shape, "shape_architecture": document.ShapeArchitecture,
+		"ocpus": fmt.Sprint(document.OCPUs), "memory_gb": fmt.Sprint(document.MemoryGB), "boot_volume_gb": fmt.Sprint(document.BootVolumeGB), "public_ip": fmt.Sprint(document.PublicIP),
+		"image_id": document.ImageID, "image_name": document.ImageName, "operating_system": document.OperatingSystem, "os_version": document.OSVersion,
+	}
+	expected := map[string]string{
+		"shape": plan.Shape, "shape_architecture": plan.ShapeArchitecture,
+		"ocpus": "2", "memory_gb": "24", "boot_volume_gb": "100", "public_ip": "true",
+		"image_id": plan.ImageID, "image_name": plan.ImageName, "operating_system": plan.OperatingSystem, "os_version": plan.OSVersion,
+	}
+	for field, value := range parity {
+		if value != expected[field] {
+			t.Errorf("JSON %s = %q, want %q", field, value, expected[field])
+		}
+		if !strings.Contains(textOutput.String(), field+": "+value+"\n") {
+			t.Errorf("text/json mismatch for %s: text=%q json=%q", field, textOutput.String(), value)
+		}
+	}
+	if document.Schema != planSchema {
+		t.Fatalf("schema=%q", document.Schema)
 	}
 }
 

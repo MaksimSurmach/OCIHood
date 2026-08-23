@@ -111,7 +111,7 @@ ocihood status --config ./config.yaml --account personal
 ```
 
 `plan` uses the same authentication and discovery path as `start`, then reports the resolved
-resources, selected image name/version and reconciliation action without writing state, waiting for
+resources, shape architecture, selected image name/version and reconciliation action without writing state, waiting for
 capacity, or mutating OCI. Use `--output=json` for schema `ocihood.plan/v1`. Resource defaults are
 configurable under `defaults`/account `overrides`; exact CLI values `--shape`, `--ocpus`,
 `--memory-gb` and `--boot-volume-gb` take precedence. If a configured default exceeds the built-in

@@ -3,6 +3,7 @@ package discovery
 
 import (
 	"context"
+	"strings"
 
 	domain "github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/provider/oci/auth"
@@ -16,6 +17,7 @@ type identityReader interface {
 	ListAvailabilityDomains(context.Context, identity.ListAvailabilityDomainsRequest) (identity.ListAvailabilityDomainsResponse, error)
 }
 type computeReader interface {
+	ListShapes(context.Context, core.ListShapesRequest) (core.ListShapesResponse, error)
 	ListImages(context.Context, core.ListImagesRequest) (core.ListImagesResponse, error)
 	ListInstances(context.Context, core.ListInstancesRequest) (core.ListInstancesResponse, error)
 }
@@ -47,6 +49,17 @@ func (p *Provider) AvailabilityDomains(ctx context.Context, tenancy string) ([]s
 		}
 	}
 	return result, nil
+}
+func (p *Provider) Shapes(ctx context.Context, q domain.Query, page string) (domain.Page[domain.Shape], error) {
+	r, err := p.compute.ListShapes(ctx, core.ListShapesRequest{CompartmentId: common.String(q.CompartmentID), Shape: optional(q.Shape), Page: optional(page)})
+	if err != nil {
+		return domain.Page[domain.Shape]{}, err
+	}
+	items := make([]domain.Shape, 0, len(r.Items))
+	for _, x := range r.Items {
+		items = append(items, domain.Shape{Name: value(x.Shape), Architecture: architecture(value(x.ProcessorDescription))})
+	}
+	return domain.Page[domain.Shape]{Items: items, Next: value(r.OpcNextPage)}, nil
 }
 func (p *Provider) Images(ctx context.Context, q domain.Query, page string) (domain.Page[domain.Image], error) {
 	r, err := p.compute.ListImages(ctx, core.ListImagesRequest{CompartmentId: common.String(q.CompartmentID), Shape: optional(q.Shape), OperatingSystem: optional(q.OperatingSystem), OperatingSystemVersion: optional(q.OSVersion), Page: optional(page), LifecycleState: core.ImageLifecycleStateAvailable})
@@ -112,6 +125,18 @@ func value(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func architecture(processor string) string {
+	processor = strings.ToLower(processor)
+	switch {
+	case strings.Contains(processor, "ampere"), strings.Contains(processor, "arm"):
+		return "aarch64"
+	case strings.Contains(processor, "amd"), strings.Contains(processor, "epyc"), strings.Contains(processor, "intel"), strings.Contains(processor, "xeon"):
+		return "x86_64"
+	default:
+		return ""
+	}
 }
 
 var _ domain.Provider = (*Provider)(nil)

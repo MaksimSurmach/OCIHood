@@ -40,6 +40,7 @@ type Page[T any] struct {
 	Next  string
 }
 type Image struct{ ID, Name, CompartmentID, OperatingSystem, OSVersion string }
+type Shape struct{ Name, Architecture string }
 type VCN struct{ ID, Name, CompartmentID string }
 type Subnet struct {
 	ID, Name, CompartmentID, VCNID, AvailabilityDomain string
@@ -54,6 +55,7 @@ type Instance struct {
 // Provider is the minimal read-only resource API consumed by discovery.
 type Provider interface {
 	AvailabilityDomains(context.Context, string) ([]string, error)
+	Shapes(context.Context, Query, string) (Page[Shape], error)
 	Images(context.Context, Query, string) (Page[Image], error)
 	VCNs(context.Context, Query, string) (Page[VCN], error)
 	Subnets(context.Context, Query, string) (Page[Subnet], error)
@@ -70,6 +72,7 @@ type Input struct {
 }
 type Result struct {
 	Account, TenancyID, CompartmentID, Region string
+	ShapeArchitecture                         string
 	AvailabilityDomains                       []string
 	Image                                     Image
 	VCN                                       VCN
@@ -91,6 +94,16 @@ func Discover(ctx context.Context, provider Provider, in Input) (Result, error) 
 		return Result{}, fail(KindNotFound, "availability domains", "no availability domains found")
 	}
 	sort.Strings(ads)
+	shapes, err := all(ctx, "shapes", func(page string) (Page[Shape], error) {
+		return provider.Shapes(ctx, Query{CompartmentID: in.CompartmentID, Shape: in.Shape}, page)
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	shape, err := selectShape(shapes, in.Shape)
+	if err != nil {
+		return Result{}, err
+	}
 
 	imageQuery := Query{CompartmentID: in.CompartmentID, Shape: in.Shape}
 	images, err := all(ctx, "images", func(page string) (Page[Image], error) {
@@ -137,7 +150,7 @@ func Discover(ctx context.Context, provider Provider, in Input) (Result, error) 
 		instances = append(instances, reconcile.Instance{ID: instance.ID, Lifecycle: instance.Lifecycle, Tags: instance.Tags})
 	}
 	sort.Slice(instances, func(i, j int) bool { return instances[i].ID < instances[j].ID })
-	return Result{Account: in.Account, TenancyID: in.TenancyID, CompartmentID: in.CompartmentID, Region: in.Region, AvailabilityDomains: ads, Image: image, VCN: vcn, Subnet: subnet, TargetID: targetID, Instances: instances}, nil
+	return Result{Account: in.Account, TenancyID: in.TenancyID, CompartmentID: in.CompartmentID, Region: in.Region, ShapeArchitecture: shape.Architecture, AvailabilityDomains: ads, Image: image, VCN: vcn, Subnet: subnet, TargetID: targetID, Instances: instances}, nil
 }
 
 func validate(in Input) error {
@@ -215,6 +228,24 @@ func selectImage(items []Image, in Input) (Image, error) {
 	})
 	return items[0], nil
 }
+
+func selectShape(items []Shape, name string) (Shape, error) {
+	candidates := make([]Shape, 0, len(items))
+	for _, shape := range items {
+		if shape.Name == name {
+			candidates = append(candidates, shape)
+		}
+	}
+	shape, err := one(candidates, "shape selection")
+	if err != nil {
+		return Shape{}, err
+	}
+	if shape.Architecture == "" {
+		return Shape{}, fail(KindProvider, "shape selection", "provider did not report shape architecture")
+	}
+	return shape, nil
+}
+
 func keepImages(items []Image, in Input) []Image {
 	out := items[:0]
 	name, operatingSystem, version := normalizeImageName(in.ImageName), normalizeImageName(in.OperatingSystem), normalizeImageName(in.OSVersion)

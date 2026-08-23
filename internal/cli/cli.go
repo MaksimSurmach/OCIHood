@@ -118,7 +118,7 @@ func newRootCommand(runner Runner) *cobra.Command {
 			if planOutput == "json" {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(newPlanDocument(result))
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "account: %s\ntarget_id: %s\nregion: %s\ncompartment_id: %s\nshape: %s\nocpus: %d\nmemory_gb: %d\nimage_id: %s\nimage_name: %s\noperating_system: %s\nos_version: %s\nvcn_id: %s\nsubnet_id: %s\nboot_volume_gb: %d\npublic_ip: %t\npolicy_decision: %s\npolicy_violations: %s\navailability_domains: %s\nmanaged_instances: %s\naction: %s\nreason: %s\n", result.Account, result.TargetID, result.Region, result.CompartmentID, result.Shape, result.OCPUs, result.MemoryGB, result.ImageID, result.ImageName, result.OperatingSystem, result.OSVersion, result.VCNID, result.SubnetID, result.BootVolumeGB, result.PublicIP, renderPolicy(result.Policy), strings.Join(result.Policy.Violations, "; "), strings.Join(result.AvailabilityDomains, ","), renderInstances(result.Instances), renderAction(result.Action), result.Reason)
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "account: %s\ntarget_id: %s\nregion: %s\ncompartment_id: %s\nshape: %s\nshape_architecture: %s\nocpus: %d\nmemory_gb: %d\nimage_id: %s\nimage_name: %s\noperating_system: %s\nos_version: %s\nvcn_id: %s\nsubnet_id: %s\nboot_volume_gb: %d\npublic_ip: %t\npolicy_decision: %s\npolicy_violations: %s\navailability_domains: %s\nmanaged_instances: %s\naction: %s\nreason: %s\n", result.Account, result.TargetID, result.Region, result.CompartmentID, result.Shape, result.ShapeArchitecture, result.OCPUs, result.MemoryGB, result.ImageID, result.ImageName, result.OperatingSystem, result.OSVersion, result.VCNID, result.SubnetID, result.BootVolumeGB, result.PublicIP, renderPolicy(result.Policy), strings.Join(result.Policy.Violations, "; "), strings.Join(result.AvailabilityDomains, ","), renderInstances(result.Instances), renderAction(result.Action), result.Reason)
 			return err
 		},
 	}
@@ -149,6 +149,7 @@ type planOutputDocument struct {
 	Region              string                `json:"region"`
 	CompartmentID       string                `json:"compartment_id"`
 	Shape               string                `json:"shape"`
+	ShapeArchitecture   string                `json:"shape_architecture"`
 	OCPUs               int                   `json:"ocpus"`
 	MemoryGB            int                   `json:"memory_gb"`
 	BootVolumeGB        int                   `json:"boot_volume_gb"`
@@ -173,7 +174,7 @@ func newPlanDocument(result app.Plan) planOutputDocument {
 	}
 	return planOutputDocument{
 		Schema: planSchema, Account: result.Account, TargetID: result.TargetID, Region: result.Region,
-		CompartmentID: result.CompartmentID, Shape: result.Shape, OCPUs: result.OCPUs, MemoryGB: result.MemoryGB,
+		CompartmentID: result.CompartmentID, Shape: result.Shape, ShapeArchitecture: result.ShapeArchitecture, OCPUs: result.OCPUs, MemoryGB: result.MemoryGB,
 		BootVolumeGB: result.BootVolumeGB, PublicIP: result.PublicIP, ImageID: result.ImageID, ImageName: result.ImageName,
 		OperatingSystem: result.OperatingSystem, OSVersion: result.OSVersion, VCNID: result.VCNID, SubnetID: result.SubnetID,
 		Policy: result.Policy, AvailabilityDomains: result.AvailabilityDomains, ManagedInstances: instances,

@@ -11,14 +11,16 @@ import (
 )
 
 type fakeProvider struct {
-	ads       []string
-	images    map[string]Page[Image]
-	vcns      map[string]Page[VCN]
-	subnets   map[string]Page[Subnet]
-	instances map[string]Page[Instance]
-	fail      string
-	calls     []string
-	queries   []Query
+	ads        []string
+	shapes     map[string]Page[Shape]
+	images     map[string]Page[Image]
+	vcns       map[string]Page[VCN]
+	subnets    map[string]Page[Subnet]
+	instances  map[string]Page[Instance]
+	fail       string
+	calls      []string
+	queries    []Query
+	shapeQuery Query
 }
 
 func (f *fakeProvider) AvailabilityDomains(context.Context, string) ([]string, error) {
@@ -27,6 +29,14 @@ func (f *fakeProvider) AvailabilityDomains(context.Context, string) ([]string, e
 		return nil, errors.New("boom")
 	}
 	return f.ads, nil
+}
+func (f *fakeProvider) Shapes(_ context.Context, q Query, p string) (Page[Shape], error) {
+	f.calls = append(f.calls, "shapes:"+p)
+	f.shapeQuery = q
+	if f.fail == "shapes" {
+		return Page[Shape]{}, errors.New("boom")
+	}
+	return f.shapes[p], nil
 }
 func (f *fakeProvider) Images(_ context.Context, q Query, p string) (Page[Image], error) {
 	f.calls = append(f.calls, "images:"+p)
@@ -62,6 +72,7 @@ func fixture() (*fakeProvider, Input) {
 	in := Input{Account: "main", TenancyID: "tenancy", CompartmentID: "compartment", Region: "eu-test-1", Shape: "VM.Standard.A1.Flex", OCPUs: 2, MemoryGB: 12, BootVolumeGB: 50, OperatingSystem: "Oracle Linux", OSVersion: "9", VCNName: "main", SubnetName: "public", PublicIP: true}
 	f := &fakeProvider{
 		ads:       []string{"AD-2", "AD-1"},
+		shapes:    map[string]Page[Shape]{"": {Items: []Shape{{Name: "VM.Standard.A1.Flex", Architecture: "aarch64"}}}},
 		images:    map[string]Page[Image]{"": {Items: []Image{{ID: "image-old", Name: "Oracle-Linux-9-2026.01", CompartmentID: "compartment", OperatingSystem: "Oracle Linux", OSVersion: "9"}}, Next: "p2"}, "p2": {Items: []Image{{ID: "image-new", Name: "Oracle-Linux-9-2026.02", CompartmentID: "compartment", OperatingSystem: "Oracle Linux", OSVersion: "9"}}}},
 		vcns:      map[string]Page[VCN]{"": {Items: []VCN{{ID: "vcn", Name: "main", CompartmentID: "compartment"}}}},
 		subnets:   map[string]Page[Subnet]{"": {Items: []Subnet{{ID: "subnet", Name: "public", CompartmentID: "compartment", VCNID: "vcn", AllowsPublicIP: true}}}},
@@ -74,7 +85,7 @@ func TestDiscoverDeterministicAndPaginated(t *testing.T) {
 	f, in := fixture()
 	target := reconcile.Target{Account: in.Account, Region: in.Region, CompartmentID: in.CompartmentID, SubnetID: "subnet", ImageID: "image-new", Shape: in.Shape, OCPUs: 2, MemoryGB: 12, BootVolumeGB: 50, PublicIP: true}
 	f.instances["p2"] = Page[Instance]{Items: []Instance{{ID: "owned", Lifecycle: reconcile.LifecycleActive, Tags: reconcile.OwnershipTags(target.ID(), in.Account)}, {ID: "terminated", Lifecycle: reconcile.LifecycleTerminated, Tags: reconcile.OwnershipTags(target.ID(), in.Account)}}}
-	want := Result{Account: "main", TenancyID: "tenancy", CompartmentID: "compartment", Region: "eu-test-1", AvailabilityDomains: []string{"AD-1", "AD-2"}, Image: Image{ID: "image-new", Name: "Oracle-Linux-9-2026.02", CompartmentID: "compartment", OperatingSystem: "Oracle Linux", OSVersion: "9"}, VCN: VCN{ID: "vcn", Name: "main", CompartmentID: "compartment"}, Subnet: Subnet{ID: "subnet", Name: "public", CompartmentID: "compartment", VCNID: "vcn", AllowsPublicIP: true}, TargetID: target.ID(), Instances: []reconcile.Instance{{ID: "owned", Lifecycle: reconcile.LifecycleActive, Tags: reconcile.OwnershipTags(target.ID(), in.Account)}, {ID: "terminated", Lifecycle: reconcile.LifecycleTerminated, Tags: reconcile.OwnershipTags(target.ID(), in.Account)}, {ID: "unrelated", Lifecycle: reconcile.LifecycleActive, Tags: map[string]string{"shape": "A1"}}}}
+	want := Result{Account: "main", TenancyID: "tenancy", CompartmentID: "compartment", Region: "eu-test-1", ShapeArchitecture: "aarch64", AvailabilityDomains: []string{"AD-1", "AD-2"}, Image: Image{ID: "image-new", Name: "Oracle-Linux-9-2026.02", CompartmentID: "compartment", OperatingSystem: "Oracle Linux", OSVersion: "9"}, VCN: VCN{ID: "vcn", Name: "main", CompartmentID: "compartment"}, Subnet: Subnet{ID: "subnet", Name: "public", CompartmentID: "compartment", VCNID: "vcn", AllowsPublicIP: true}, TargetID: target.ID(), Instances: []reconcile.Instance{{ID: "owned", Lifecycle: reconcile.LifecycleActive, Tags: reconcile.OwnershipTags(target.ID(), in.Account)}, {ID: "terminated", Lifecycle: reconcile.LifecycleTerminated, Tags: reconcile.OwnershipTags(target.ID(), in.Account)}, {ID: "unrelated", Lifecycle: reconcile.LifecycleActive, Tags: map[string]string{"shape": "A1"}}}}
 	for range 2 {
 		got, err := Discover(t.Context(), f, in)
 		if err != nil {
@@ -84,8 +95,11 @@ func TestDiscoverDeterministicAndPaginated(t *testing.T) {
 			t.Fatalf("result mismatch\n got: %#v\nwant: %#v", got, want)
 		}
 	}
-	if !reflect.DeepEqual(f.calls[:6], []string{"ads", "images:", "images:p2", "vcns:", "subnets:", "instances:"}) {
+	if !reflect.DeepEqual(f.calls[:7], []string{"ads", "shapes:", "images:", "images:p2", "vcns:", "subnets:", "instances:"}) {
 		t.Fatalf("unexpected calls: %v", f.calls)
+	}
+	if f.shapeQuery.CompartmentID != in.CompartmentID || f.shapeQuery.Shape != in.Shape {
+		t.Fatalf("shape query = %#v", f.shapeQuery)
 	}
 }
 
@@ -96,6 +110,8 @@ func TestDiscoverSelectionFailures(t *testing.T) {
 		kind   Kind
 	}{
 		{"zero images", func(f *fakeProvider, _ *Input) { f.images = map[string]Page[Image]{"": {}} }, KindNotFound},
+		{"missing shape", func(f *fakeProvider, _ *Input) { f.shapes = map[string]Page[Shape]{"": {}} }, KindNotFound},
+		{"missing architecture", func(f *fakeProvider, _ *Input) { f.shapes[""].Items[0].Architecture = "" }, KindProvider},
 		{"explicit incompatible image", func(f *fakeProvider, in *Input) { in.ImageID, in.OperatingSystem, in.OSVersion = "missing", "", "" }, KindNotFound},
 		{"explicit image in wrong compartment", func(f *fakeProvider, in *Input) {
 			in.ImageID, in.OperatingSystem, in.OSVersion = "image-old", "", ""
@@ -156,7 +172,7 @@ func TestDiscoverRejectsPaginationCycle(t *testing.T) {
 }
 
 func TestDiscoverProviderErrorsAndCancellation(t *testing.T) {
-	for _, stage := range []string{"ads", "images", "vcns", "subnets", "instances"} {
+	for _, stage := range []string{"ads", "shapes", "images", "vcns", "subnets", "instances"} {
 		t.Run(stage, func(t *testing.T) {
 			f, in := fixture()
 			f.fail = stage
