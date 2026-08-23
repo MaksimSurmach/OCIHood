@@ -48,15 +48,16 @@ type Result struct {
 
 // Plan is the deterministic, read-only provisioning intent.
 type Plan struct {
-	Account, TargetID, Region, CompartmentID string
-	Shape, ImageID, VCNID, SubnetID          string
-	OCPUs, MemoryGB, BootVolumeGB            int
-	PublicIP                                 bool
-	AvailabilityDomains                      []string
-	Instances                                []reconcile.Instance
-	Action                                   reconcile.DecisionKind
-	Reason                                   string
-	Policy                                   config.PolicyDecision
+	Account, TargetID, Region, CompartmentID              string
+	Shape, ImageID, ImageName, OperatingSystem, OSVersion string
+	VCNID, SubnetID                                       string
+	OCPUs, MemoryGB, BootVolumeGB                         int
+	PublicIP                                              bool
+	AvailabilityDomains                                   []string
+	Instances                                             []reconcile.Instance
+	Action                                                reconcile.DecisionKind
+	Reason                                                string
+	Policy                                                config.PolicyDecision
 }
 
 // Error identifies the application phase that failed.
@@ -292,7 +293,7 @@ func (r *Runner) Plan(ctx context.Context, request Request) (Plan, error) {
 	}
 	return Plan{
 		Account: effective.Account, TargetID: discovered.TargetID, Region: effective.Region, CompartmentID: discovered.CompartmentID,
-		Shape: effective.Shape, ImageID: discovered.Image.ID, VCNID: discovered.VCN.ID, SubnetID: discovered.Subnet.ID,
+		Shape: effective.Shape, ImageID: discovered.Image.ID, ImageName: discovered.Image.Name, OperatingSystem: discovered.Image.OperatingSystem, OSVersion: discovered.Image.OSVersion, VCNID: discovered.VCN.ID, SubnetID: discovered.Subnet.ID,
 		OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, BootVolumeGB: effective.BootVolumeGB, PublicIP: effective.PublicIP,
 		AvailabilityDomains: append([]string(nil), discovered.AvailabilityDomains...), Instances: managed,
 		Action: decision.Kind, Reason: decision.Reason,

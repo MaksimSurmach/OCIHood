@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
@@ -95,9 +96,9 @@ func TestDiscoverSelectionFailures(t *testing.T) {
 		kind   Kind
 	}{
 		{"zero images", func(f *fakeProvider, _ *Input) { f.images = map[string]Page[Image]{"": {}} }, KindNotFound},
-		{"explicit incompatible image", func(f *fakeProvider, in *Input) { in.ImageID = "missing" }, KindNotFound},
+		{"explicit incompatible image", func(f *fakeProvider, in *Input) { in.ImageID, in.OperatingSystem, in.OSVersion = "missing", "", "" }, KindNotFound},
 		{"explicit image in wrong compartment", func(f *fakeProvider, in *Input) {
-			in.ImageID = "image-old"
+			in.ImageID, in.OperatingSystem, in.OSVersion = "image-old", "", ""
 			x := f.images[""].Items[0]
 			x.CompartmentID = "other"
 			f.images[""] = Page[Image]{Items: []Image{x}}
@@ -114,7 +115,7 @@ func TestDiscoverSelectionFailures(t *testing.T) {
 			x.VCNID = "other"
 			f.subnets[""] = Page[Subnet]{Items: []Subnet{x}}
 		}, KindNotFound},
-		{"ambiguous unfiltered image", func(_ *fakeProvider, in *Input) { in.OperatingSystem = ""; in.OSVersion = "" }, KindAmbiguous},
+		{"missing image selector", func(_ *fakeProvider, in *Input) { in.OperatingSystem = ""; in.OSVersion = "" }, KindInvalid},
 		{"ambiguous VCN", func(f *fakeProvider, in *Input) {
 			in.VCNName = ""
 			f.vcns[""] = Page[VCN]{Items: append(f.vcns[""].Items, VCN{ID: "vcn2", CompartmentID: "compartment"})}
@@ -178,9 +179,7 @@ func TestDiscoverProviderErrorsAndCancellation(t *testing.T) {
 
 func TestExplicitOverrides(t *testing.T) {
 	f, in := fixture()
-	in.ImageID = "image-old"
-	in.OperatingSystem = "Ubuntu"
-	in.OSVersion = "24.04"
+	in.ImageID, in.OperatingSystem, in.OSVersion = "image-old", "", ""
 	in.VCNID = "vcn"
 	in.VCNName = ""
 	in.SubnetID = "subnet"
@@ -194,5 +193,68 @@ func TestExplicitOverrides(t *testing.T) {
 	}
 	if f.queries[0].OperatingSystem != "" || f.queries[0].OSVersion != "" || f.queries[0].Shape != in.Shape {
 		t.Fatalf("explicit image query applied optional filters: %#v", f.queries[0])
+	}
+}
+
+func TestImageSelectionUsesPublicOCIDAndFuzzyName(t *testing.T) {
+	f, in := fixture()
+	in.ImageID, in.OperatingSystem, in.OSVersion = "image-old", "", ""
+	page := f.images[""]
+	page.Items[0].CompartmentID = ""
+	f.images[""] = page
+	got, err := Discover(t.Context(), f, in)
+	if err != nil || got.Image.ID != "image-old" {
+		t.Fatalf("public image = %#v, err=%v", got.Image, err)
+	}
+
+	f, in = fixture()
+	in.ImageName, in.OperatingSystem, in.OSVersion = "ORACLE LINUX 9 2026 02", "", ""
+	got, err = Discover(t.Context(), f, in)
+	if err != nil || got.Image.ID != "image-new" {
+		t.Fatalf("fuzzy image = %#v, err=%v", got.Image, err)
+	}
+}
+
+func TestImageSelectionFuzzyOSAndAmbiguousName(t *testing.T) {
+	f, in := fixture()
+	in.OperatingSystem, in.OSVersion = "oracle linux", "9"
+	got, err := Discover(t.Context(), f, in)
+	if err != nil || got.Image.ID != "image-new" {
+		t.Fatalf("fuzzy OS image = %#v, err=%v", got.Image, err)
+	}
+	if query := f.queries[0]; query.Shape != in.Shape || query.OperatingSystem != "" || query.OSVersion != "" {
+		t.Fatalf("fuzzy discovery query = %#v", query)
+	}
+
+	f, in = fixture()
+	in.ImageName, in.OperatingSystem, in.OSVersion = "oracle linux 9", "", ""
+	_, err = Discover(t.Context(), f, in)
+	var discoveryErr *Error
+	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindAmbiguous || !strings.Contains(err.Error(), "matched 2") {
+		t.Fatalf("ambiguous image error = %v", err)
+	}
+}
+
+func TestImageSelectorsAreRequiredAndExclusive(t *testing.T) {
+	f, in := fixture()
+	in.OperatingSystem, in.OSVersion = "", ""
+	_, err := Discover(t.Context(), f, in)
+	var discoveryErr *Error
+	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindInvalid {
+		t.Fatalf("missing selector error = %v", err)
+	}
+
+	f, in = fixture()
+	in.ImageID = "image-old"
+	_, err = Discover(t.Context(), f, in)
+	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindInvalid {
+		t.Fatalf("mixed selector error = %v", err)
+	}
+
+	f, in = fixture()
+	in.ImageName, in.OSVersion, in.OperatingSystem = "Ubuntu", "24.04", ""
+	_, err = Discover(t.Context(), f, in)
+	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindInvalid || !strings.Contains(err.Error(), "os_version requires operating_system") {
+		t.Fatalf("version selector error = %v", err)
 	}
 }

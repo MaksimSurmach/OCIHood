@@ -50,7 +50,7 @@ func main() {
 		return discovery.Discover(ctx, ocidiscovery.New(clients), discovery.Input{
 			Account: effective.Account, TenancyID: clients.TenancyOCID, CompartmentID: effective.CompartmentID,
 			Region: clients.Region, Shape: effective.Shape, OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB,
-			BootVolumeGB: effective.BootVolumeGB, ImageID: effective.ImageID, OperatingSystem: effective.OperatingSystem,
+			BootVolumeGB: effective.BootVolumeGB, ImageID: effective.ImageID, ImageName: effective.ImageName, OperatingSystem: effective.OperatingSystem,
 			OSVersion: effective.OSVersion, VCNID: effective.VCNID, VCNName: effective.VCNName,
 			SubnetID: effective.SubnetID, SubnetName: effective.SubnetName, PublicIP: effective.PublicIP,
 		})

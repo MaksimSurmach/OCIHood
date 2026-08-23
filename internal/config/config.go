@@ -106,7 +106,7 @@ type PolicyDecision struct {
 // Overrides contains explicitly set CLI values. Pointer fields preserve explicit zero and false values.
 type Overrides struct {
 	OCIConfigPath, OCIProfile, Region, SSHPublicKeyPath, SSHPrivateKeyPath *string
-	CompartmentID, ImageID, OperatingSystem, OSVersion                     *string
+	CompartmentID, ImageID, ImageName, OperatingSystem, OSVersion          *string
 	VCNID, VCNName, SubnetID, SubnetName                                   *string
 	Settings                                                               Settings
 }
@@ -120,6 +120,7 @@ type Account struct {
 	SSHPrivateKeyPath string   `yaml:"ssh_private_key_path,omitempty"`
 	CompartmentID     string   `yaml:"compartment_id,omitempty"`
 	ImageID           string   `yaml:"image_id,omitempty"`
+	ImageName         string   `yaml:"image_name,omitempty"`
 	OperatingSystem   string   `yaml:"operating_system,omitempty"`
 	OSVersion         string   `yaml:"os_version,omitempty"`
 	VCNID             string   `yaml:"vcn_id,omitempty"`
@@ -139,6 +140,7 @@ type Effective struct {
 	SSHPrivateKeyPath string        `yaml:"ssh_private_key_path,omitempty"`
 	CompartmentID     string        `yaml:"compartment_id,omitempty"`
 	ImageID           string        `yaml:"image_id,omitempty"`
+	ImageName         string        `yaml:"image_name,omitempty"`
 	OperatingSystem   string        `yaml:"operating_system,omitempty"`
 	OSVersion         string        `yaml:"os_version,omitempty"`
 	VCNID             string        `yaml:"vcn_id,omitempty"`
@@ -223,6 +225,9 @@ func (f File) Validate() error {
 		}
 		if account.SubnetID != "" && account.SubnetName != "" {
 			return fmt.Errorf("account %q subnet_id and subnet_name are mutually exclusive", name)
+		}
+		if account.ImageID != "" && (account.ImageName != "" || account.OperatingSystem != "" || account.OSVersion != "") {
+			return fmt.Errorf("account %q image_id is mutually exclusive with image_name, operating_system and os_version", name)
 		}
 		if _, err := f.Resolve(name); err != nil {
 			return err
@@ -324,6 +329,7 @@ func (f File) Resolve(name string) (Effective, error) {
 	e.SSHPrivateKeyPath = account.SSHPrivateKeyPath
 	e.CompartmentID = account.CompartmentID
 	e.ImageID = account.ImageID
+	e.ImageName = account.ImageName
 	e.OperatingSystem = account.OperatingSystem
 	e.OSVersion = account.OSVersion
 	e.VCNID = account.VCNID
@@ -467,6 +473,17 @@ func EvaluatePolicy(e Effective) PolicyDecision {
 // ApplyOverrides applies explicitly set CLI values and validates the resulting configuration.
 func ApplyOverrides(e Effective, o Overrides) (Effective, error) {
 	apply(&e, o.Settings)
+	imageIDSet := o.ImageID != nil
+	imageSelectorSet := o.ImageName != nil || o.OperatingSystem != nil || o.OSVersion != nil
+	if imageIDSet && imageSelectorSet {
+		return Effective{}, errors.New("image_id is mutually exclusive with image_name, operating_system and os_version")
+	}
+	if imageIDSet {
+		e.ImageName, e.OperatingSystem, e.OSVersion = "", "", ""
+	}
+	if imageSelectorSet {
+		e.ImageID = ""
+	}
 	if o.VCNID != nil && o.VCNName == nil {
 		e.VCNName = ""
 	}
@@ -482,7 +499,7 @@ func ApplyOverrides(e Effective, o Overrides) (Effective, error) {
 	for value, target := range map[*string]*string{
 		o.OCIConfigPath: &e.OCIConfigPath, o.OCIProfile: &e.OCIProfile, o.Region: &e.Region,
 		o.SSHPublicKeyPath: &e.SSHPublicKeyPath, o.SSHPrivateKeyPath: &e.SSHPrivateKeyPath,
-		o.CompartmentID: &e.CompartmentID, o.ImageID: &e.ImageID, o.OperatingSystem: &e.OperatingSystem,
+		o.CompartmentID: &e.CompartmentID, o.ImageID: &e.ImageID, o.ImageName: &e.ImageName, o.OperatingSystem: &e.OperatingSystem,
 		o.OSVersion: &e.OSVersion, o.VCNID: &e.VCNID, o.VCNName: &e.VCNName,
 		o.SubnetID: &e.SubnetID, o.SubnetName: &e.SubnetName,
 	} {

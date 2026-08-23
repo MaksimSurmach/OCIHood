@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 )
@@ -63,7 +64,7 @@ type Query struct{ CompartmentID, Shape, OperatingSystem, OSVersion, VCNID strin
 type Input struct {
 	Account, TenancyID, CompartmentID, Region, Shape string
 	OCPUs, MemoryGB, BootVolumeGB                    int
-	ImageID, OperatingSystem, OSVersion              string
+	ImageID, ImageName, OperatingSystem, OSVersion   string
 	VCNID, VCNName, SubnetID, SubnetName             string
 	PublicIP                                         bool
 }
@@ -92,9 +93,6 @@ func Discover(ctx context.Context, provider Provider, in Input) (Result, error) 
 	sort.Strings(ads)
 
 	imageQuery := Query{CompartmentID: in.CompartmentID, Shape: in.Shape}
-	if in.ImageID == "" {
-		imageQuery.OperatingSystem, imageQuery.OSVersion = in.OperatingSystem, in.OSVersion
-	}
 	images, err := all(ctx, "images", func(page string) (Page[Image], error) {
 		return provider.Images(ctx, imageQuery, page)
 	})
@@ -151,6 +149,17 @@ func validate(in Input) error {
 	if in.OCPUs <= 0 || in.MemoryGB <= 0 || in.BootVolumeGB <= 0 {
 		return fail(KindInvalid, "input", "ocpus, memory_gb and boot_volume_gb must be positive")
 	}
+	hasImageID := strings.TrimSpace(in.ImageID) != ""
+	hasImageSelector := strings.TrimSpace(in.ImageName) != "" || strings.TrimSpace(in.OperatingSystem) != "" || strings.TrimSpace(in.OSVersion) != ""
+	if !hasImageID && !hasImageSelector {
+		return fail(KindInvalid, "image selection", "one of image_id or image_name/operating_system/os_version is required")
+	}
+	if hasImageID && hasImageSelector {
+		return fail(KindInvalid, "image selection", "image_id is mutually exclusive with image_name, operating_system and os_version")
+	}
+	if strings.TrimSpace(in.OSVersion) != "" && strings.TrimSpace(in.OperatingSystem) == "" {
+		return fail(KindInvalid, "image selection", "os_version requires operating_system")
+	}
 	if in.VCNID != "" && in.VCNName != "" {
 		return fail(KindInvalid, "input", "vcn_id and vcn_name are mutually exclusive")
 	}
@@ -184,14 +193,17 @@ func all[T any](ctx context.Context, stage string, fetch func(string) (Page[T], 
 }
 
 func selectImage(items []Image, in Input) (Image, error) {
-	if in.ImageID != "" {
+	if strings.TrimSpace(in.ImageID) != "" {
 		return exactImage(items, in.ImageID, in.CompartmentID)
 	}
 	items = keepImages(items, in)
 	if len(items) == 0 {
 		return Image{}, fail(KindNotFound, "image selection", "no compatible image found")
 	}
-	if len(items) > 1 && in.OperatingSystem == "" && in.OSVersion == "" {
+	if len(items) > 1 && in.ImageName != "" {
+		return Image{}, fail(KindAmbiguous, "image selection", fmt.Sprintf("image name matched %d compatible images", len(items)))
+	}
+	if len(items) > 1 && in.ImageName == "" && in.OperatingSystem == "" && in.OSVersion == "" {
 		return Image{}, fail(KindAmbiguous, "image selection", fmt.Sprintf("found %d candidates; configure an explicit OCID or OS filters", len(items)))
 	}
 	// Newest platform images sort lexically by OCI display name; ID is the stable tie-breaker.
@@ -205,16 +217,31 @@ func selectImage(items []Image, in Input) (Image, error) {
 }
 func keepImages(items []Image, in Input) []Image {
 	out := items[:0]
+	name, operatingSystem, version := normalizeImageName(in.ImageName), normalizeImageName(in.OperatingSystem), normalizeImageName(in.OSVersion)
 	for _, x := range items {
-		if (in.OperatingSystem == "" || x.OperatingSystem == in.OperatingSystem) && (in.OSVersion == "" || x.OSVersion == in.OSVersion) {
+		if name != "" && !strings.Contains(normalizeImageName(x.Name), name) {
+			continue
+		}
+		if (operatingSystem == "" || strings.Contains(normalizeImageName(x.OperatingSystem), operatingSystem)) && (version == "" || strings.Contains(normalizeImageName(x.OSVersion), version)) {
 			out = append(out, x)
 		}
 	}
 	return out
 }
+
+func normalizeImageName(value string) string {
+	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return unicode.ToLower(r)
+		}
+		return ' '
+	}, value)), " ")
+}
+
 func exactImage(items []Image, id, compartmentID string) (Image, error) {
 	for _, x := range items {
-		if x.ID == id && x.CompartmentID == compartmentID {
+		// Public platform images have no owning compartment in OCI responses.
+		if x.ID == id && (x.CompartmentID == "" || x.CompartmentID == compartmentID) {
 			return x, nil
 		}
 	}
