@@ -15,6 +15,7 @@ import (
 	"github.com/MaksimSurmach/OCIHood/internal/app"
 	"github.com/MaksimSurmach/OCIHood/internal/capacity"
 	"github.com/MaksimSurmach/OCIHood/internal/config"
+	"github.com/MaksimSurmach/OCIHood/internal/discovery"
 	"github.com/MaksimSurmach/OCIHood/internal/launch"
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 	"github.com/MaksimSurmach/OCIHood/internal/state"
@@ -51,6 +52,7 @@ func newRootCommand(runner Runner) *cobra.Command {
 	var account string
 	var values startValues
 	var execution executionValues
+	var planOutput string
 	root := &cobra.Command{
 		Use:           "ocihood",
 		Short:         "Provision Oracle Cloud Infrastructure resources",
@@ -105,17 +107,25 @@ func newRootCommand(runner Runner) *cobra.Command {
 	plan := &cobra.Command{
 		Use: "plan", Short: "Show resolved provisioning intent without modifying OCI", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if planOutput != "text" && planOutput != "json" {
+				return fmt.Errorf("invalid --output %q", planOutput)
+			}
 			overrides, configless := values.overrides(cmd)
 			result, err := runner.Plan(cmd.Context(), app.Request{ConfigPath: configPath, Account: account, Overrides: overrides, Configless: configPath == "" && configless})
 			if err != nil {
 				return fmt.Errorf("plan provisioning run: %w", err)
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "account: %s\ntarget_id: %s\nregion: %s\ncompartment_id: %s\nshape: %s\nocpus: %d\nmemory_gb: %d\nimage_id: %s\nvcn_id: %s\nsubnet_id: %s\nboot_volume_gb: %d\npublic_ip: %t\npolicy_decision: %s\npolicy_violations: %s\navailability_domains: %s\nmanaged_instances: %s\naction: %s\nreason: %s\n", result.Account, result.TargetID, result.Region, result.CompartmentID, result.Shape, result.OCPUs, result.MemoryGB, result.ImageID, result.VCNID, result.SubnetID, result.BootVolumeGB, result.PublicIP, renderPolicy(result.Policy), strings.Join(result.Policy.Violations, "; "), strings.Join(result.AvailabilityDomains, ","), renderInstances(result.Instances), renderAction(result.Action), result.Reason)
+			if planOutput == "json" {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(newPlanDocument(result))
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "account: %s\ntarget_id: %s\nregion: %s\ncompartment_id: %s\nshape: %s\nshape_architecture: %s\nocpus: %d\nmemory_gb: %d\nimage_id: %s\nimage_name: %s\noperating_system: %s\nos_version: %s\nvcn_id: %s\nsubnet_id: %s\nboot_volume_gb: %d\npublic_ip: %t\npolicy_decision: %s\npolicy_violations: %s\navailability_domains: %s\nmanaged_instances: %s\naction: %s\nreason: %s\n", result.Account, result.TargetID, result.Region, result.CompartmentID, result.Shape, result.ShapeArchitecture, result.OCPUs, result.MemoryGB, result.ImageID, result.ImageName, result.OperatingSystem, result.OSVersion, result.VCNID, result.SubnetID, result.BootVolumeGB, result.PublicIP, renderPolicy(result.Policy), strings.Join(result.Policy.Violations, "; "), strings.Join(result.AvailabilityDomains, ","), renderInstances(result.Instances), renderAction(result.Action), result.Reason)
 			return err
 		},
 	}
 	plan.Flags().StringVar(&account, "account", "", "account name")
+	plan.Flags().StringVar(&planOutput, "output", "text", "plan format: text or json")
 	values.bind(plan)
+	plan.Example = "  ocihood plan --account personal --output=json"
 	_ = plan.MarkFlagRequired("account")
 	root.AddCommand(plan)
 	root.AddCommand(newConfigCommand(&configPath))
@@ -125,6 +135,52 @@ func newRootCommand(runner Runner) *cobra.Command {
 }
 
 const resultSchema = "ocihood.start/v1"
+const planSchema = "ocihood.plan/v1"
+
+type planInstance struct {
+	ID        string `json:"id"`
+	Lifecycle string `json:"lifecycle"`
+}
+
+type planOutputDocument struct {
+	Schema              string                `json:"schema"`
+	Account             string                `json:"account"`
+	TargetID            string                `json:"target_id"`
+	Region              string                `json:"region"`
+	CompartmentID       string                `json:"compartment_id"`
+	Shape               string                `json:"shape"`
+	ShapeArchitecture   string                `json:"shape_architecture"`
+	OCPUs               int                   `json:"ocpus"`
+	MemoryGB            int                   `json:"memory_gb"`
+	BootVolumeGB        int                   `json:"boot_volume_gb"`
+	PublicIP            bool                  `json:"public_ip"`
+	ImageID             string                `json:"image_id"`
+	ImageName           string                `json:"image_name"`
+	OperatingSystem     string                `json:"operating_system"`
+	OSVersion           string                `json:"os_version"`
+	VCNID               string                `json:"vcn_id"`
+	SubnetID            string                `json:"subnet_id"`
+	Policy              config.PolicyDecision `json:"policy"`
+	AvailabilityDomains []string              `json:"availability_domains"`
+	ManagedInstances    []planInstance        `json:"managed_instances"`
+	Action              string                `json:"action"`
+	Reason              string                `json:"reason"`
+}
+
+func newPlanDocument(result app.Plan) planOutputDocument {
+	instances := make([]planInstance, 0, len(result.Instances))
+	for _, instance := range result.Instances {
+		instances = append(instances, planInstance{ID: instance.ID, Lifecycle: string(instance.Lifecycle)})
+	}
+	return planOutputDocument{
+		Schema: planSchema, Account: result.Account, TargetID: result.TargetID, Region: result.Region,
+		CompartmentID: result.CompartmentID, Shape: result.Shape, ShapeArchitecture: result.ShapeArchitecture, OCPUs: result.OCPUs, MemoryGB: result.MemoryGB,
+		BootVolumeGB: result.BootVolumeGB, PublicIP: result.PublicIP, ImageID: result.ImageID, ImageName: result.ImageName,
+		OperatingSystem: result.OperatingSystem, OSVersion: result.OSVersion, VCNID: result.VCNID, SubnetID: result.SubnetID,
+		Policy: result.Policy, AvailabilityDomains: result.AvailabilityDomains, ManagedInstances: instances,
+		Action: renderAction(result.Action), Reason: result.Reason,
+	}
+}
 
 type commandDocument struct {
 	Schema             string                 `json:"schema"`
@@ -209,6 +265,8 @@ func commandResult(account string, result app.Result, err error) (commandDocumen
 		}
 		if result.Capacity == capacity.Unavailable {
 			doc.Outcome = "no_capacity"
+			doc.Error.Category = "capacity"
+			doc.Error.Message = "no capacity available in configured availability domains"
 			return doc, 3
 		}
 		return doc, 0
@@ -220,13 +278,20 @@ func commandResult(account string, result app.Result, err error) (commandDocumen
 	} else if errors.Is(err, context.Canceled) {
 		doc.Outcome, doc.Error.Category, doc.Error.Message, code = "canceled", "canceled", "provisioning canceled", 130
 	} else {
+		var discoveryErr *discovery.Error
 		var capacityErr *capacity.Error
 		var launchErr *launch.Error
-		if errors.As(err, &capacityErr) && (capacityErr.Kind == capacity.Transient || capacityErr.Kind == capacity.Throttled) || errors.As(err, &launchErr) && (launchErr.Kind == launch.Transient || launchErr.Kind == launch.Ambiguous || launchErr.Kind == launch.OutOfCapacity) {
+		if errors.As(err, &discoveryErr) && (discoveryErr.Kind == discovery.KindInvalid || discoveryErr.Kind == discovery.KindNotFound || discoveryErr.Kind == discovery.KindAmbiguous) {
+			doc.Outcome, doc.Error.Category, doc.Error.Message = string(discoveryErr.Kind), string(discoveryErr.Kind), discoveryErr.Err.Error()
+			if discoveryErr.Kind == discovery.KindInvalid {
+				code = 2
+			}
+		} else if errors.As(err, &capacityErr) && (capacityErr.Kind == capacity.Transient || capacityErr.Kind == capacity.Throttled) || errors.As(err, &launchErr) && (launchErr.Kind == launch.Transient || launchErr.Kind == launch.Ambiguous || launchErr.Kind == launch.OutOfCapacity) {
 			doc.Outcome, doc.Error.Category, doc.Error.Message, code = "retryable_failure", "transient", "retryable provider failure", 4
 		} else {
 			var appErr *app.Error
 			if errors.As(err, &appErr) {
+				doc.Error.Category = appErr.Phase
 				doc.Error.Message = "provisioning failed during " + appErr.Phase
 			}
 		}
@@ -276,7 +341,7 @@ func renderInstances(instances []reconcile.Instance) string {
 
 type startValues struct {
 	ociConfig, ociProfile, region, sshPublicKey, sshPrivateKey string
-	compartment, image, operatingSystem, osVersion             string
+	compartment, image, imageName, operatingSystem, osVersion  string
 	vcnID, vcnName, subnetID, subnetName, stateDir, logDir     string
 	shape                                                      string
 	ocpus, memoryGB, bootVolumeGB                              int
@@ -293,6 +358,7 @@ func (v *startValues) bind(command *cobra.Command) {
 	f.StringVar(&v.sshPrivateKey, "ssh-private-key", "", "SSH private key file reference")
 	f.StringVar(&v.compartment, "compartment-id", "", "target compartment OCID")
 	f.StringVar(&v.image, "image-id", "", "image OCID")
+	f.StringVar(&v.imageName, "image-name", "", "case-insensitive image name selector")
 	f.StringVar(&v.operatingSystem, "operating-system", "", "image operating system selector")
 	f.StringVar(&v.osVersion, "os-version", "", "image operating system version selector")
 	f.StringVar(&v.vcnID, "vcn-id", "", "VCN OCID")
@@ -338,6 +404,7 @@ func (v startValues) overrides(command *cobra.Command) (config.Overrides, bool) 
 	setString("ssh-private-key", v.sshPrivateKey, &o.SSHPrivateKeyPath)
 	setString("compartment-id", v.compartment, &o.CompartmentID)
 	setString("image-id", v.image, &o.ImageID)
+	setString("image-name", v.imageName, &o.ImageName)
 	setString("operating-system", v.operatingSystem, &o.OperatingSystem)
 	setString("os-version", v.osVersion, &o.OSVersion)
 	setString("vcn-id", v.vcnID, &o.VCNID)

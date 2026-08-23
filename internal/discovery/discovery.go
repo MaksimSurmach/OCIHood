@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 )
@@ -39,6 +40,7 @@ type Page[T any] struct {
 	Next  string
 }
 type Image struct{ ID, Name, CompartmentID, OperatingSystem, OSVersion string }
+type Shape struct{ Name, Architecture string }
 type VCN struct{ ID, Name, CompartmentID string }
 type Subnet struct {
 	ID, Name, CompartmentID, VCNID, AvailabilityDomain string
@@ -53,6 +55,7 @@ type Instance struct {
 // Provider is the minimal read-only resource API consumed by discovery.
 type Provider interface {
 	AvailabilityDomains(context.Context, string) ([]string, error)
+	Shapes(context.Context, Query, string) (Page[Shape], error)
 	Images(context.Context, Query, string) (Page[Image], error)
 	VCNs(context.Context, Query, string) (Page[VCN], error)
 	Subnets(context.Context, Query, string) (Page[Subnet], error)
@@ -63,12 +66,13 @@ type Query struct{ CompartmentID, Shape, OperatingSystem, OSVersion, VCNID strin
 type Input struct {
 	Account, TenancyID, CompartmentID, Region, Shape string
 	OCPUs, MemoryGB, BootVolumeGB                    int
-	ImageID, OperatingSystem, OSVersion              string
+	ImageID, ImageName, OperatingSystem, OSVersion   string
 	VCNID, VCNName, SubnetID, SubnetName             string
 	PublicIP                                         bool
 }
 type Result struct {
 	Account, TenancyID, CompartmentID, Region string
+	ShapeArchitecture                         string
 	AvailabilityDomains                       []string
 	Image                                     Image
 	VCN                                       VCN
@@ -90,11 +94,18 @@ func Discover(ctx context.Context, provider Provider, in Input) (Result, error) 
 		return Result{}, fail(KindNotFound, "availability domains", "no availability domains found")
 	}
 	sort.Strings(ads)
+	shapes, err := all(ctx, "shapes", func(page string) (Page[Shape], error) {
+		return provider.Shapes(ctx, Query{CompartmentID: in.CompartmentID, Shape: in.Shape}, page)
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	shape, err := selectShape(shapes, in.Shape)
+	if err != nil {
+		return Result{}, err
+	}
 
 	imageQuery := Query{CompartmentID: in.CompartmentID, Shape: in.Shape}
-	if in.ImageID == "" {
-		imageQuery.OperatingSystem, imageQuery.OSVersion = in.OperatingSystem, in.OSVersion
-	}
 	images, err := all(ctx, "images", func(page string) (Page[Image], error) {
 		return provider.Images(ctx, imageQuery, page)
 	})
@@ -139,7 +150,7 @@ func Discover(ctx context.Context, provider Provider, in Input) (Result, error) 
 		instances = append(instances, reconcile.Instance{ID: instance.ID, Lifecycle: instance.Lifecycle, Tags: instance.Tags})
 	}
 	sort.Slice(instances, func(i, j int) bool { return instances[i].ID < instances[j].ID })
-	return Result{Account: in.Account, TenancyID: in.TenancyID, CompartmentID: in.CompartmentID, Region: in.Region, AvailabilityDomains: ads, Image: image, VCN: vcn, Subnet: subnet, TargetID: targetID, Instances: instances}, nil
+	return Result{Account: in.Account, TenancyID: in.TenancyID, CompartmentID: in.CompartmentID, Region: in.Region, ShapeArchitecture: shape.Architecture, AvailabilityDomains: ads, Image: image, VCN: vcn, Subnet: subnet, TargetID: targetID, Instances: instances}, nil
 }
 
 func validate(in Input) error {
@@ -150,6 +161,17 @@ func validate(in Input) error {
 	}
 	if in.OCPUs <= 0 || in.MemoryGB <= 0 || in.BootVolumeGB <= 0 {
 		return fail(KindInvalid, "input", "ocpus, memory_gb and boot_volume_gb must be positive")
+	}
+	hasImageID := strings.TrimSpace(in.ImageID) != ""
+	hasImageSelector := strings.TrimSpace(in.ImageName) != "" || strings.TrimSpace(in.OperatingSystem) != "" || strings.TrimSpace(in.OSVersion) != ""
+	if !hasImageID && !hasImageSelector {
+		return fail(KindInvalid, "image selection", "one of image_id or image_name/operating_system/os_version is required")
+	}
+	if hasImageID && hasImageSelector {
+		return fail(KindInvalid, "image selection", "image_id is mutually exclusive with image_name, operating_system and os_version")
+	}
+	if strings.TrimSpace(in.OSVersion) != "" && strings.TrimSpace(in.OperatingSystem) == "" {
+		return fail(KindInvalid, "image selection", "os_version requires operating_system")
 	}
 	if in.VCNID != "" && in.VCNName != "" {
 		return fail(KindInvalid, "input", "vcn_id and vcn_name are mutually exclusive")
@@ -184,14 +206,17 @@ func all[T any](ctx context.Context, stage string, fetch func(string) (Page[T], 
 }
 
 func selectImage(items []Image, in Input) (Image, error) {
-	if in.ImageID != "" {
+	if strings.TrimSpace(in.ImageID) != "" {
 		return exactImage(items, in.ImageID, in.CompartmentID)
 	}
 	items = keepImages(items, in)
 	if len(items) == 0 {
 		return Image{}, fail(KindNotFound, "image selection", "no compatible image found")
 	}
-	if len(items) > 1 && in.OperatingSystem == "" && in.OSVersion == "" {
+	if len(items) > 1 && in.ImageName != "" {
+		return Image{}, fail(KindAmbiguous, "image selection", fmt.Sprintf("image name matched %d compatible images", len(items)))
+	}
+	if len(items) > 1 && in.ImageName == "" && in.OperatingSystem == "" && in.OSVersion == "" {
 		return Image{}, fail(KindAmbiguous, "image selection", fmt.Sprintf("found %d candidates; configure an explicit OCID or OS filters", len(items)))
 	}
 	// Newest platform images sort lexically by OCI display name; ID is the stable tie-breaker.
@@ -203,18 +228,51 @@ func selectImage(items []Image, in Input) (Image, error) {
 	})
 	return items[0], nil
 }
+
+func selectShape(items []Shape, name string) (Shape, error) {
+	candidates := make([]Shape, 0, len(items))
+	for _, shape := range items {
+		if shape.Name == name {
+			candidates = append(candidates, shape)
+		}
+	}
+	shape, err := one(candidates, "shape selection")
+	if err != nil {
+		return Shape{}, err
+	}
+	if shape.Architecture == "" {
+		return Shape{}, fail(KindProvider, "shape selection", "provider did not report shape architecture")
+	}
+	return shape, nil
+}
+
 func keepImages(items []Image, in Input) []Image {
 	out := items[:0]
+	name, operatingSystem, version := normalizeImageName(in.ImageName), normalizeImageName(in.OperatingSystem), normalizeImageName(in.OSVersion)
 	for _, x := range items {
-		if (in.OperatingSystem == "" || x.OperatingSystem == in.OperatingSystem) && (in.OSVersion == "" || x.OSVersion == in.OSVersion) {
+		if name != "" && !strings.Contains(normalizeImageName(x.Name), name) {
+			continue
+		}
+		if (operatingSystem == "" || strings.Contains(normalizeImageName(x.OperatingSystem), operatingSystem)) && (version == "" || strings.Contains(normalizeImageName(x.OSVersion), version)) {
 			out = append(out, x)
 		}
 	}
 	return out
 }
+
+func normalizeImageName(value string) string {
+	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return unicode.ToLower(r)
+		}
+		return ' '
+	}, value)), " ")
+}
+
 func exactImage(items []Image, id, compartmentID string) (Image, error) {
 	for _, x := range items {
-		if x.ID == id && x.CompartmentID == compartmentID {
+		// Public platform images have no owning compartment in OCI responses.
+		if x.ID == id && (x.CompartmentID == "" || x.CompartmentID == compartmentID) {
 			return x, nil
 		}
 	}

@@ -164,6 +164,9 @@ func TestSDKContractReadFlowsAndPagination(t *testing.T) {
 		expectedRequest{http.MethodGet, "/20160918/availabilityDomains?compartmentId=root", func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, []map[string]any{{"name": "AD-1", "compartmentId": "root"}})
 		}},
+		expectedRequest{http.MethodGet, "/20160918/shapes?compartmentId=compartment&shape=VM.Standard.A1.Flex", func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(t, w, []map[string]any{{"shape": "VM.Standard.A1.Flex", "processorDescription": "Ampere Altra"}})
+		}},
 		expectedRequest{http.MethodGet, "/20160918/images?compartmentId=compartment&lifecycleState=AVAILABLE&operatingSystem=Oracle+Linux&operatingSystemVersion=9&shape=VM.Standard.A1.Flex", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("opc-next-page", "images-2")
 			writeJSON(t, w, []map[string]any{{"id": "image-1", "displayName": "OL 9.1", "compartmentId": "compartment", "operatingSystem": "Oracle Linux", "operatingSystemVersion": "9"}})
@@ -190,6 +193,9 @@ func TestSDKContractReadFlowsAndPagination(t *testing.T) {
 		t.Fatalf("ADs=%v err=%v", ads, err)
 	}
 	query := discoverydomain.Query{CompartmentID: "compartment", Shape: "VM.Standard.A1.Flex", OperatingSystem: "Oracle Linux", OSVersion: "9"}
+	if shapes, err := provider.Shapes(t.Context(), query, ""); err != nil || len(shapes.Items) != 1 || shapes.Items[0].Architecture != "aarch64" {
+		t.Fatalf("shapes=%+v err=%v", shapes, err)
+	}
 	first, err := provider.Images(t.Context(), query, "")
 	if err != nil || first.Next != "images-2" {
 		t.Fatalf("first page=%+v err=%v", first, err)

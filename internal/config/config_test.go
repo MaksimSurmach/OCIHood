@@ -127,6 +127,7 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		{name: "zero breaker failures", body: "defaults:\n  circuit_breaker:\n    failures: 0\n", want: "circuit_breaker.failures is outside its safe range"},
 		{name: "excess half open probes", body: "defaults:\n  circuit_breaker:\n    half_open_requests: 11\n", want: "circuit_breaker.half_open_requests is outside its safe range"},
 		{name: "short breaker timeout", body: "defaults:\n  circuit_breaker:\n    open_timeout: 500ms\n", want: "circuit_breaker.open_timeout is outside its safe range"},
+		{name: "mixed image selectors", body: "accounts:\n  one:\n    image_id: image\n    operating_system: Ubuntu\n", want: "image_id is mutually exclusive"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -300,6 +301,8 @@ func TestApplyOverridesPrecedenceAndExplicitValues(t *testing.T) {
 		{name: "resource override is checked by policy", overrides: Overrides{Settings: Settings{OCPUs: intValue(5)}}, check: func(got Effective) bool { return got.OCPUs == 5 && !EvaluatePolicy(got).Allowed }},
 		{name: "explicit zero is validated", overrides: Overrides{Settings: Settings{OCPUs: intValue(0)}}, wantErr: "ocpus must be greater than zero"},
 		{name: "exclusive selector replaces lower layer", overrides: Overrides{VCNID: stringValue("id")}, check: func(got Effective) bool { return got.VCNID == "id" && got.VCNName == "" }},
+		{name: "image name replaces image id", overrides: Overrides{ImageName: stringValue("Ubuntu")}, check: func(got Effective) bool { return got.ImageName == "Ubuntu" }},
+		{name: "image selectors are exclusive", overrides: Overrides{ImageID: stringValue("image"), OperatingSystem: stringValue("Ubuntu")}, wantErr: "image_id is mutually exclusive"},
 		{name: "cross-field validation", overrides: Overrides{VCNID: stringValue("id"), VCNName: stringValue("name")}, wantErr: "mutually exclusive"},
 	}
 	for _, tt := range tests {

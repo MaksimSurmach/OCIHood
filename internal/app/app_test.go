@@ -161,7 +161,7 @@ func TestPlanIsDeterministicAndReadOnly(t *testing.T) {
 	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
 	var instances []reconcile.Instance
 	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
-		return discovery.Result{TargetID: targetID, CompartmentID: "compartment", Image: discovery.Image{ID: "image"}, VCN: discovery.VCN{ID: "vcn"}, Subnet: discovery.Subnet{ID: "subnet"}, AvailabilityDomains: []string{"AD-1"}, Instances: instances}, nil
+		return discovery.Result{TargetID: targetID, CompartmentID: "compartment", ShapeArchitecture: "aarch64", Image: discovery.Image{ID: "image"}, VCN: discovery.VCN{ID: "vcn"}, Subnet: discovery.Subnet{ID: "subnet"}, AvailabilityDomains: []string{"AD-1"}, Instances: instances}, nil
 	}, func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, bool) (capacity.Result, error) {
 		provider.Create()
 		return capacity.Result{}, nil
@@ -179,7 +179,7 @@ func TestPlanIsDeterministicAndReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(first, second) || first.Action != reconcile.DecisionCreate || first.ImageID != "image" || first.SubnetID != "subnet" || provider.mutationCalls() != 0 {
+	if !reflect.DeepEqual(first, second) || first.Action != reconcile.DecisionCreate || first.ShapeArchitecture != "aarch64" || first.ImageID != "image" || first.SubnetID != "subnet" || provider.mutationCalls() != 0 {
 		t.Fatalf("plans=%+v / %+v mutations=%d", first, second, provider.mutationCalls())
 	}
 	if _, err := state.New(effective.StateDir).Load("personal", targetID); !errors.Is(err, state.ErrNotFound) {

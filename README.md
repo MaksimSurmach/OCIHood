@@ -51,6 +51,8 @@ accounts:
     ssh_public_key_path: /home/me/.ssh/id_ed25519.pub
     ssh_private_key_path: /home/me/.ssh/id_ed25519
     compartment_id: ocid1.compartment.oc1..example
+    # Use image_id instead of image_name/operating_system/os_version for exact selection.
+    image_name: Oracle-Linux-9
     operating_system: Oracle Linux
     os_version: "9"
     vcn_name: main
@@ -73,11 +75,12 @@ set `policy.allow_exceed: true` explicitly in global or account configuration to
 There is no interactive or implicit unattended override, and capacity retries never change the
 requested shape, OCPUs, memory or boot volume.
 
-Discovery is read-only and paginates every OCI list operation. Explicit image, VCN and subnet
-OCIDs take precedence. VCN/subnet names must resolve uniquely. With OS filters, image selection
-uses descending display name (newest OCI platform-image name) and image OCID as a stable tie-breaker;
-without filters, multiple images are rejected as ambiguous. All availability domains are retained
-in sorted order for later rotation.
+Discovery is read-only and paginates every OCI list operation. Exactly one image mode is required:
+`image_id`, or discovery selectors `image_name` and/or `operating_system` (with optional version).
+Image names use case-insensitive fuzzy matching. The OCI shape filter constrains discovery to images compatible with the requested architecture; the newest matching
+display name wins, with image OCID as a stable tie-breaker. Public platform image OCIDs are valid
+even when OCI returns an empty image compartment. VCN/subnet names must resolve uniquely. All
+availability domains are retained in sorted order for later rotation.
 
 ## Desired-resource identity and reconciliation
 
@@ -108,7 +111,12 @@ ocihood status --config ./config.yaml --account personal
 ```
 
 `plan` uses the same authentication and discovery path as `start`, then reports the resolved
-resources and reconciliation action without writing state, waiting for capacity, or mutating OCI.
+resources, shape architecture, selected image name/version and reconciliation action without writing state, waiting for
+capacity, or mutating OCI. Use `--output=json` for schema `ocihood.plan/v1`. Resource defaults are
+configurable under `defaults`/account `overrides`; exact CLI values `--shape`, `--ocpus`,
+`--memory-gb` and `--boot-volume-gb` take precedence. If a configured default exceeds the built-in
+12 GiB policy ceiling, raise `policy.max_memory_gb` explicitly as well; no larger quota/cost profile
+is selected implicitly.
 `status` reads the sole persisted target for the account without contacting OCI or mutating state.
 If multiple target states exist, it fails instead of choosing one.
 `start` performs discovery, loads this state under the target lock, runs the reconciliation
