@@ -167,11 +167,11 @@ func TestSDKContractReadFlowsAndPagination(t *testing.T) {
 		expectedRequest{http.MethodGet, "/20160918/shapes?compartmentId=compartment&shape=VM.Standard.A1.Flex", func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, []map[string]any{{"shape": "VM.Standard.A1.Flex", "processorDescription": "Ampere Altra"}})
 		}},
-		expectedRequest{http.MethodGet, "/20160918/images?compartmentId=compartment&lifecycleState=AVAILABLE&operatingSystem=Oracle+Linux&operatingSystemVersion=9&shape=VM.Standard.A1.Flex", func(w http.ResponseWriter, _ *http.Request) {
+		expectedRequest{http.MethodGet, "/20160918/images?compartmentId=compartment&lifecycleState=AVAILABLE&shape=VM.Standard.A1.Flex", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("opc-next-page", "images-2")
 			writeJSON(t, w, []map[string]any{{"id": "image-1", "displayName": "OL 9.1", "compartmentId": "compartment", "operatingSystem": "Oracle Linux", "operatingSystemVersion": "9"}})
 		}},
-		expectedRequest{http.MethodGet, "/20160918/images?compartmentId=compartment&lifecycleState=AVAILABLE&operatingSystem=Oracle+Linux&operatingSystemVersion=9&page=images-2&shape=VM.Standard.A1.Flex", func(w http.ResponseWriter, _ *http.Request) {
+		expectedRequest{http.MethodGet, "/20160918/images?compartmentId=compartment&lifecycleState=AVAILABLE&page=images-2&shape=VM.Standard.A1.Flex", func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, []map[string]any{{"id": "image-2", "displayName": "OL 9.2", "compartmentId": "compartment", "operatingSystem": "Oracle Linux", "operatingSystemVersion": "9"}})
 		}},
 		expectedRequest{http.MethodGet, "/20160918/vcns?compartmentId=compartment&lifecycleState=AVAILABLE", func(w http.ResponseWriter, _ *http.Request) {
@@ -192,7 +192,7 @@ func TestSDKContractReadFlowsAndPagination(t *testing.T) {
 	if ads, err := provider.AvailabilityDomains(t.Context(), "root"); err != nil || !reflect.DeepEqual(ads, []string{"AD-1"}) {
 		t.Fatalf("ADs=%v err=%v", ads, err)
 	}
-	query := discoverydomain.Query{CompartmentID: "compartment", Shape: "VM.Standard.A1.Flex", OperatingSystem: "Oracle Linux", OSVersion: "9"}
+	query := discoverydomain.Query{CompartmentID: "compartment", Shape: "VM.Standard.A1.Flex"}
 	if shapes, err := provider.Shapes(t.Context(), query, ""); err != nil || len(shapes.Items) != 1 || shapes.Items[0].Architecture != "aarch64" {
 		t.Fatalf("shapes=%+v err=%v", shapes, err)
 	}

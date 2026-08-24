@@ -154,6 +154,24 @@ func TestConfiglessMissingRequiredInputStopsBeforeProvider(t *testing.T) {
 
 func pointer(value string) *string { return &value }
 
+func TestImagesListsWithoutProvisioningDiscoveryOrState(t *testing.T) {
+	t.Parallel()
+	effective := config.Effective{Account: "personal", Region: "configured-region", CompartmentID: "compartment", Shape: "VM.Standard.A1.Flex", StateDir: t.TempDir()}
+	provider := &fakeBootstrapper{run: func(context.Context) error { return nil }}
+	discoveryCalls := 0
+	runner := NewRunner(slog.Default(), func(context.Context, string, string) (config.Effective, error) { return effective, nil }, func(context.Context, config.Effective) (provisioner.Bootstrapper, error) { return provider, nil }, func(context.Context, provisioner.Bootstrapper, config.Effective) (discovery.Result, error) {
+		discoveryCalls++
+		return discovery.Result{}, nil
+	})
+	runner.SetImageList(func(context.Context, provisioner.Bootstrapper, config.Effective) (string, []discovery.Image, error) {
+		return "resolved-region", []discovery.Image{{ID: "image", Name: "Oracle-Linux-9"}}, nil
+	})
+	got, err := runner.Images(t.Context(), Request{Account: "personal"})
+	if err != nil || got.Account != "personal" || got.Region != "resolved-region" || got.Shape != "VM.Standard.A1.Flex" || len(got.Images) != 1 || got.Images[0].ID != "image" || discoveryCalls != 0 || provider.mutationCalls() != 0 {
+		t.Fatalf("result=%+v err=%v discovery_calls=%d mutations=%d", got, err, discoveryCalls, provider.mutationCalls())
+	}
+}
+
 func TestPlanIsDeterministicAndReadOnly(t *testing.T) {
 	t.Parallel()
 	effective := config.Effective{Account: "personal", Region: "region", CompartmentID: "compartment", StateDir: t.TempDir(), Shape: "shape", OCPUs: 2, MemoryGB: 12, BootVolumeGB: 50, PublicIP: true}

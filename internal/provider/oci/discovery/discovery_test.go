@@ -65,7 +65,7 @@ func TestProviderMapsReadOnlyRequests(t *testing.T) {
 	if err != nil || len(shapes.Items) != 1 || shapes.Items[0].Architecture != "aarch64" || shapes.Next != "next" {
 		t.Fatalf("shapes: %#v %v", shapes, err)
 	}
-	images, err := p.Images(ctx, domain.Query{CompartmentID: "compartment", Shape: "shape", OperatingSystem: "Oracle Linux", OSVersion: "9"}, "page")
+	images, err := p.Images(ctx, domain.Query{CompartmentID: "compartment", Shape: "shape"}, "page")
 	if err != nil || len(images.Items) != 1 || images.Next != "next" {
 		t.Fatalf("images: %#v %v", images, err)
 	}

@@ -51,10 +51,7 @@ accounts:
     ssh_public_key_path: /home/me/.ssh/id_ed25519.pub
     ssh_private_key_path: /home/me/.ssh/id_ed25519
     compartment_id: ocid1.compartment.oc1..example
-    # Use image_id instead of image_name/operating_system/os_version for exact selection.
-    image_name: Oracle-Linux-9
-    operating_system: Oracle Linux
-    os_version: "9"
+    image_id: ubuntu # or an exact ocid1.image...
     vcn_name: main
     subnet_name: public
     overrides:
@@ -75,10 +72,11 @@ set `policy.allow_exceed: true` explicitly in global or account configuration to
 There is no interactive or implicit unattended override, and capacity retries never change the
 requested shape, OCPUs, memory or boot volume.
 
-Discovery is read-only and paginates every OCI list operation. Exactly one image mode is required:
-`image_id`, or discovery selectors `image_name` and/or `operating_system` (with optional version).
-Image names use case-insensitive fuzzy matching. The OCI shape filter constrains discovery to images compatible with the requested architecture; the newest matching
-display name wins, with image OCID as a stable tie-breaker. Public platform image OCIDs are valid
+Discovery is read-only and paginates every OCI list operation. `image_id` is required; OCIHood
+does not select images by mutable names or OS metadata. `ocihood images list` returns the current
+`AVAILABLE` images compatible with the configured shape, newest first, so an exact OCID can be
+chosen before `plan` or `start`. The reserved value `ubuntu` resolves to the newest standard image
+of the highest compatible `Canonical Ubuntu` version. Public platform image OCIDs are valid
 even when OCI returns an empty image compartment. VCN/subnet names must resolve uniquely. All
 availability domains are retained in sorted order for later rotation.
 
@@ -106,6 +104,8 @@ private keys or notification credentials.
 ```sh
 ocihood config validate --config ./config.yaml
 ocihood config show --config ./config.yaml --account personal
+ocihood images list --config ./config.yaml --account personal
+ocihood images list --config ./config.yaml --account personal --output=json
 ocihood plan --config ./config.yaml --account personal
 ocihood status --config ./config.yaml --account personal
 ```
@@ -117,6 +117,9 @@ configurable under `defaults`/account `overrides`; exact CLI values `--shape`, `
 `--memory-gb` and `--boot-volume-gb` take precedence. If a configured default exceeds the built-in
 12 GiB policy ceiling, raise `policy.max_memory_gb` explicitly as well; no larger quota/cost profile
 is selected implicitly.
+`images list` authenticates and reads only the Compute image inventory for the resolved compartment
+and shape. Text output is tabular; JSON uses schema `ocihood.images/v1`. It does not read or write
+provisioning state and does not discover VCNs, subnets, instances, or capacity.
 `status` reads the sole persisted target for the account without contacting OCI or mutating state.
 If multiple target states exist, it fails instead of choosing one.
 `start` performs discovery, loads this state under the target lock, runs the reconciliation

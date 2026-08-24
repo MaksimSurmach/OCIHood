@@ -61,6 +61,12 @@ type Plan struct {
 	Policy                                         config.PolicyDecision
 }
 
+// ImageList is the current read-only OCI image inventory for one account and shape.
+type ImageList struct {
+	Account, Region, Shape string
+	Images                 []discovery.Image
+}
+
 // Error identifies the application phase that failed.
 type Error struct {
 	Phase string
@@ -85,6 +91,9 @@ type WatchCapacity func(context.Context, provisioner.Bootstrapper, config.Effect
 // LaunchInstance executes the mutating and lifecycle portion after reconciliation.
 type LaunchInstance func(context.Context, provisioner.Bootstrapper, config.Effective, discovery.Result, reconcile.Decision, capacity.Result, string) (launch.Instance, error)
 
+// ListImages returns the current shape-compatible OCI image inventory and resolved region.
+type ListImages func(context.Context, provisioner.Bootstrapper, config.Effective) (string, []discovery.Image, error)
+
 // Runner coordinates configuration, authentication, and provisioning.
 type Runner struct {
 	logger          *slog.Logger
@@ -93,6 +102,7 @@ type Runner struct {
 	discover        Discover
 	watchCapacity   WatchCapacity
 	launchInstance  LaunchInstance
+	listImages      ListImages
 	random          io.Reader
 	now             func() time.Time
 	notifier        notification.Notifier
@@ -135,6 +145,9 @@ func (r *Runner) notify(ctx context.Context, result *Result, event notification.
 
 // SetLaunch enables the production launch phase while preserving lightweight read-only runners in tests.
 func (r *Runner) SetLaunch(launchInstance LaunchInstance) { r.launchInstance = launchInstance }
+
+// SetImageList enables read-only image inventory.
+func (r *Runner) SetImageList(listImages ListImages) { r.listImages = listImages }
 
 // SetLogger updates diagnostics for the next run.
 func (r *Runner) SetLogger(logger *slog.Logger) { r.logger = logger }
@@ -302,17 +315,33 @@ func (r *Runner) Plan(ctx context.Context, request Request) (Plan, error) {
 	}, nil
 }
 
+// Images returns the current shape-compatible OCI images without discovery or state writes.
+func (r *Runner) Images(ctx context.Context, request Request) (ImageList, error) {
+	effective, err := r.resolve(ctx, request)
+	if err != nil {
+		return ImageList{}, err
+	}
+	if effective.CompartmentID == "" {
+		return ImageList{}, &Error{Phase: "config", Err: errors.New("compartment_id is required")}
+	}
+	provider, err := r.bootstrap(ctx, request.Account, effective)
+	if err != nil {
+		return ImageList{}, err
+	}
+	if r.listImages == nil {
+		return ImageList{}, &Error{Phase: "images", Err: errors.New("image listing is not configured")}
+	}
+	region, images, err := r.listImages(ctx, provider, effective)
+	if err != nil {
+		return ImageList{}, &Error{Phase: "images", Err: err}
+	}
+	return ImageList{Account: effective.Account, Region: region, Shape: effective.Shape, Images: images}, nil
+}
+
 func (r *Runner) prepare(ctx context.Context, request Request) (config.Effective, provisioner.Bootstrapper, discovery.Result, error) {
-	effective, err := r.load(ctx, request.ConfigPath, request.Account)
-	if request.Configless && errors.Is(err, os.ErrNotExist) {
-		effective, err = config.Defaults(request.Account)
-	}
+	effective, err := r.resolve(ctx, request)
 	if err != nil {
-		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: err}
-	}
-	effective, err = config.ApplyOverrides(effective, request.Overrides)
-	if err != nil {
-		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: err}
+		return config.Effective{}, nil, discovery.Result{}, err
 	}
 	if request.Configless {
 		if effective.CompartmentID == "" {
@@ -329,21 +358,9 @@ func (r *Runner) prepare(ctx context.Context, request Request) (config.Effective
 			return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: fmt.Errorf("close SSH public key: %w", closeErr)}
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return config.Effective{}, nil, discovery.Result{}, &Error{Phase: "config", Err: err}
-	}
-	provider, err := r.authenticate(ctx, effective)
+	provider, err := r.bootstrap(ctx, request.Account, effective)
 	if err != nil {
-		return effective, nil, discovery.Result{}, &Error{Phase: "authentication", Err: err}
-	}
-	if err := ctx.Err(); err != nil {
-		return effective, nil, discovery.Result{}, &Error{Phase: "authentication", Err: err}
-	}
-	if err := (provisioner.Run{Account: request.Account, Settings: effective, Logger: r.logger, Bootstrapper: provider}).Execute(ctx); err != nil {
-		return effective, provider, discovery.Result{}, &Error{Phase: "bootstrap", Err: err}
-	}
-	if err := ctx.Err(); err != nil {
-		return effective, provider, discovery.Result{}, &Error{Phase: "bootstrap", Err: err}
+		return effective, nil, discovery.Result{}, err
 	}
 	discovered, err := r.discover(ctx, provider, effective)
 	if err != nil {
@@ -353,6 +370,41 @@ func (r *Runner) prepare(ctx context.Context, request Request) (config.Effective
 		return effective, provider, discovered, &Error{Phase: "discovery", Err: err}
 	}
 	return effective, provider, discovered, nil
+}
+
+func (r *Runner) resolve(ctx context.Context, request Request) (config.Effective, error) {
+	effective, err := r.load(ctx, request.ConfigPath, request.Account)
+	if request.Configless && errors.Is(err, os.ErrNotExist) {
+		effective, err = config.Defaults(request.Account)
+	}
+	if err != nil {
+		return config.Effective{}, &Error{Phase: "config", Err: err}
+	}
+	effective, err = config.ApplyOverrides(effective, request.Overrides)
+	if err != nil {
+		return config.Effective{}, &Error{Phase: "config", Err: err}
+	}
+	if err := ctx.Err(); err != nil {
+		return config.Effective{}, &Error{Phase: "config", Err: err}
+	}
+	return effective, nil
+}
+
+func (r *Runner) bootstrap(ctx context.Context, account string, effective config.Effective) (provisioner.Bootstrapper, error) {
+	provider, err := r.authenticate(ctx, effective)
+	if err != nil {
+		return nil, &Error{Phase: "authentication", Err: err}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, &Error{Phase: "authentication", Err: err}
+	}
+	if err := (provisioner.Run{Account: account, Settings: effective, Logger: r.logger, Bootstrapper: provider}).Execute(ctx); err != nil {
+		return nil, &Error{Phase: "bootstrap", Err: err}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, &Error{Phase: "bootstrap", Err: err}
+	}
+	return provider, nil
 }
 
 func newAttemptAndPersist(effective config.Effective, targetID string, random io.Reader, now time.Time) (reconcile.Attempt, error) {

@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 )
@@ -69,7 +70,7 @@ func (f *fakeProvider) Instances(_ context.Context, _ string, p string) (Page[In
 }
 
 func fixture() (*fakeProvider, Input) {
-	in := Input{Account: "main", TenancyID: "tenancy", CompartmentID: "compartment", Region: "eu-test-1", Shape: "VM.Standard.A1.Flex", OCPUs: 2, MemoryGB: 12, BootVolumeGB: 50, OperatingSystem: "Oracle Linux", OSVersion: "9", VCNName: "main", SubnetName: "public", PublicIP: true}
+	in := Input{Account: "main", TenancyID: "tenancy", CompartmentID: "compartment", Region: "eu-test-1", Shape: "VM.Standard.A1.Flex", OCPUs: 2, MemoryGB: 12, BootVolumeGB: 50, ImageID: "image-new", VCNName: "main", SubnetName: "public", PublicIP: true}
 	f := &fakeProvider{
 		ads:       []string{"AD-2", "AD-1"},
 		shapes:    map[string]Page[Shape]{"": {Items: []Shape{{Name: "VM.Standard.A1.Flex", Architecture: "aarch64"}}}},
@@ -112,9 +113,9 @@ func TestDiscoverSelectionFailures(t *testing.T) {
 		{"zero images", func(f *fakeProvider, _ *Input) { f.images = map[string]Page[Image]{"": {}} }, KindNotFound},
 		{"missing shape", func(f *fakeProvider, _ *Input) { f.shapes = map[string]Page[Shape]{"": {}} }, KindNotFound},
 		{"missing architecture", func(f *fakeProvider, _ *Input) { f.shapes[""].Items[0].Architecture = "" }, KindProvider},
-		{"explicit incompatible image", func(f *fakeProvider, in *Input) { in.ImageID, in.OperatingSystem, in.OSVersion = "missing", "", "" }, KindNotFound},
+		{"explicit incompatible image", func(_ *fakeProvider, in *Input) { in.ImageID = "missing" }, KindNotFound},
 		{"explicit image in wrong compartment", func(f *fakeProvider, in *Input) {
-			in.ImageID, in.OperatingSystem, in.OSVersion = "image-old", "", ""
+			in.ImageID = "image-old"
 			x := f.images[""].Items[0]
 			x.CompartmentID = "other"
 			f.images[""] = Page[Image]{Items: []Image{x}}
@@ -131,7 +132,7 @@ func TestDiscoverSelectionFailures(t *testing.T) {
 			x.VCNID = "other"
 			f.subnets[""] = Page[Subnet]{Items: []Subnet{x}}
 		}, KindNotFound},
-		{"missing image selector", func(_ *fakeProvider, in *Input) { in.OperatingSystem = ""; in.OSVersion = "" }, KindInvalid},
+		{"missing image ID", func(_ *fakeProvider, in *Input) { in.ImageID = "" }, KindInvalid},
 		{"ambiguous VCN", func(f *fakeProvider, in *Input) {
 			in.VCNName = ""
 			f.vcns[""] = Page[VCN]{Items: append(f.vcns[""].Items, VCN{ID: "vcn2", CompartmentID: "compartment"})}
@@ -195,7 +196,7 @@ func TestDiscoverProviderErrorsAndCancellation(t *testing.T) {
 
 func TestExplicitOverrides(t *testing.T) {
 	f, in := fixture()
-	in.ImageID, in.OperatingSystem, in.OSVersion = "image-old", "", ""
+	in.ImageID = "image-old"
 	in.VCNID = "vcn"
 	in.VCNName = ""
 	in.SubnetID = "subnet"
@@ -207,14 +208,14 @@ func TestExplicitOverrides(t *testing.T) {
 	if got.Image.ID != "image-old" || got.VCN.ID != "vcn" || got.Subnet.ID != "subnet" {
 		t.Fatalf("overrides ignored: %#v", got)
 	}
-	if f.queries[0].OperatingSystem != "" || f.queries[0].OSVersion != "" || f.queries[0].Shape != in.Shape {
-		t.Fatalf("explicit image query applied optional filters: %#v", f.queries[0])
+	if f.queries[0].Shape != in.Shape {
+		t.Fatalf("explicit image query = %#v", f.queries[0])
 	}
 }
 
-func TestImageSelectionUsesPublicOCIDAndFuzzyName(t *testing.T) {
+func TestImageSelectionUsesPublicOCID(t *testing.T) {
 	f, in := fixture()
-	in.ImageID, in.OperatingSystem, in.OSVersion = "image-old", "", ""
+	in.ImageID = "image-old"
 	page := f.images[""]
 	page.Items[0].CompartmentID = ""
 	f.images[""] = page
@@ -222,55 +223,58 @@ func TestImageSelectionUsesPublicOCIDAndFuzzyName(t *testing.T) {
 	if err != nil || got.Image.ID != "image-old" {
 		t.Fatalf("public image = %#v, err=%v", got.Image, err)
 	}
-
-	f, in = fixture()
-	in.ImageName, in.OperatingSystem, in.OSVersion = "ORACLE LINUX 9 2026 02", "", ""
-	got, err = Discover(t.Context(), f, in)
-	if err != nil || got.Image.ID != "image-new" {
-		t.Fatalf("fuzzy image = %#v, err=%v", got.Image, err)
-	}
 }
 
-func TestImageSelectionFuzzyOSAndAmbiguousName(t *testing.T) {
+func TestImageIDIsRequired(t *testing.T) {
 	f, in := fixture()
-	in.OperatingSystem, in.OSVersion = "oracle linux", "9"
-	got, err := Discover(t.Context(), f, in)
-	if err != nil || got.Image.ID != "image-new" {
-		t.Fatalf("fuzzy OS image = %#v, err=%v", got.Image, err)
-	}
-	if query := f.queries[0]; query.Shape != in.Shape || query.OperatingSystem != "" || query.OSVersion != "" {
-		t.Fatalf("fuzzy discovery query = %#v", query)
-	}
-
-	f, in = fixture()
-	in.ImageName, in.OperatingSystem, in.OSVersion = "oracle linux 9", "", ""
-	_, err = Discover(t.Context(), f, in)
-	var discoveryErr *Error
-	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindAmbiguous || !strings.Contains(err.Error(), "matched 2") {
-		t.Fatalf("ambiguous image error = %v", err)
-	}
-}
-
-func TestImageSelectorsAreRequiredAndExclusive(t *testing.T) {
-	f, in := fixture()
-	in.OperatingSystem, in.OSVersion = "", ""
+	in.ImageID = ""
 	_, err := Discover(t.Context(), f, in)
 	var discoveryErr *Error
-	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindInvalid {
-		t.Fatalf("missing selector error = %v", err)
+	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindInvalid || !strings.Contains(err.Error(), "ocihood images list") {
+		t.Fatalf("missing image ID error = %v", err)
 	}
+}
 
-	f, in = fixture()
-	in.ImageID = "image-old"
-	_, err = Discover(t.Context(), f, in)
-	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindInvalid {
-		t.Fatalf("mixed selector error = %v", err)
+func TestUnknownImageIDExplainsHowToCheck(t *testing.T) {
+	f, in := fixture()
+	in.ImageID = "missing-image"
+	_, err := Discover(t.Context(), f, in)
+	var discoveryErr *Error
+	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindNotFound || !strings.Contains(err.Error(), `image_id "missing-image" was not found`) || !strings.Contains(err.Error(), "ocihood images list") {
+		t.Fatalf("unknown image ID error = %v", err)
 	}
+}
 
-	f, in = fixture()
-	in.ImageName, in.OSVersion, in.OperatingSystem = "Ubuntu", "24.04", ""
-	_, err = Discover(t.Context(), f, in)
-	if !errors.As(err, &discoveryErr) || discoveryErr.Kind != KindInvalid || !strings.Contains(err.Error(), "os_version requires operating_system") {
-		t.Fatalf("version selector error = %v", err)
+func TestUbuntuAliasSelectsNewestCompatibleImage(t *testing.T) {
+	f, in := fixture()
+	in.ImageID = "ubuntu"
+	old, latest := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	first := f.images[""]
+	first.Items = append(first.Items,
+		Image{ID: "ubuntu-22", OperatingSystem: "Canonical Ubuntu", OSVersion: "22.04", CreatedAt: latest},
+		Image{ID: "ubuntu-24-minimal", OperatingSystem: "Canonical Ubuntu", OSVersion: "24.04 Minimal aarch64", CreatedAt: latest},
+	)
+	f.images[""] = first
+	second := f.images["p2"]
+	second.Items[0] = Image{ID: "ubuntu-24", OperatingSystem: "Canonical Ubuntu", OSVersion: "24.04", CreatedAt: old}
+	f.images["p2"] = second
+	got, err := Discover(t.Context(), f, in)
+	if err != nil || got.Image.ID != "ubuntu-24" {
+		t.Fatalf("image=%+v err=%v", got.Image, err)
+	}
+}
+
+func TestListImagesIsPaginatedAndNewestFirst(t *testing.T) {
+	f, _ := fixture()
+	old, latest := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	first := f.images[""]
+	first.Items[0].CreatedAt = old
+	f.images[""] = first
+	second := f.images["p2"]
+	second.Items[0].CreatedAt = latest
+	f.images["p2"] = second
+	images, err := ListImages(t.Context(), f, Query{CompartmentID: "compartment", Shape: "VM.Standard.A1.Flex"})
+	if err != nil || len(images) != 2 || images[0].ID != "image-new" || images[1].ID != "image-old" {
+		t.Fatalf("images=%+v err=%v", images, err)
 	}
 }

@@ -6,8 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
-	"unicode"
+	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/reconcile"
 )
@@ -39,7 +40,10 @@ type Page[T any] struct {
 	Items []T
 	Next  string
 }
-type Image struct{ ID, Name, CompartmentID, OperatingSystem, OSVersion string }
+type Image struct {
+	ID, Name, CompartmentID, OperatingSystem, OSVersion string
+	CreatedAt                                           time.Time
+}
 type Shape struct{ Name, Architecture string }
 type VCN struct{ ID, Name, CompartmentID string }
 type Subnet struct {
@@ -62,11 +66,11 @@ type Provider interface {
 	Instances(context.Context, string, string) (Page[Instance], error)
 }
 
-type Query struct{ CompartmentID, Shape, OperatingSystem, OSVersion, VCNID string }
+type Query struct{ CompartmentID, Shape, VCNID string }
 type Input struct {
 	Account, TenancyID, CompartmentID, Region, Shape string
 	OCPUs, MemoryGB, BootVolumeGB                    int
-	ImageID, ImageName, OperatingSystem, OSVersion   string
+	ImageID                                          string
 	VCNID, VCNName, SubnetID, SubnetName             string
 	PublicIP                                         bool
 }
@@ -105,14 +109,11 @@ func Discover(ctx context.Context, provider Provider, in Input) (Result, error) 
 		return Result{}, err
 	}
 
-	imageQuery := Query{CompartmentID: in.CompartmentID, Shape: in.Shape}
-	images, err := all(ctx, "images", func(page string) (Page[Image], error) {
-		return provider.Images(ctx, imageQuery, page)
-	})
+	images, err := ListImages(ctx, provider, Query{CompartmentID: in.CompartmentID, Shape: in.Shape})
 	if err != nil {
 		return Result{}, err
 	}
-	image, err := selectImage(images, in)
+	image, err := selectImage(images, in.ImageID, in.CompartmentID)
 	if err != nil {
 		return Result{}, err
 	}
@@ -162,16 +163,8 @@ func validate(in Input) error {
 	if in.OCPUs <= 0 || in.MemoryGB <= 0 || in.BootVolumeGB <= 0 {
 		return fail(KindInvalid, "input", "ocpus, memory_gb and boot_volume_gb must be positive")
 	}
-	hasImageID := strings.TrimSpace(in.ImageID) != ""
-	hasImageSelector := strings.TrimSpace(in.ImageName) != "" || strings.TrimSpace(in.OperatingSystem) != "" || strings.TrimSpace(in.OSVersion) != ""
-	if !hasImageID && !hasImageSelector {
-		return fail(KindInvalid, "image selection", "one of image_id or image_name/operating_system/os_version is required")
-	}
-	if hasImageID && hasImageSelector {
-		return fail(KindInvalid, "image selection", "image_id is mutually exclusive with image_name, operating_system and os_version")
-	}
-	if strings.TrimSpace(in.OSVersion) != "" && strings.TrimSpace(in.OperatingSystem) == "" {
-		return fail(KindInvalid, "image selection", "os_version requires operating_system")
+	if strings.TrimSpace(in.ImageID) == "" {
+		return fail(KindInvalid, "image selection", "image_id is required; run `ocihood images list` and check the value")
 	}
 	if in.VCNID != "" && in.VCNName != "" {
 		return fail(KindInvalid, "input", "vcn_id and vcn_name are mutually exclusive")
@@ -205,28 +198,21 @@ func all[T any](ctx context.Context, stage string, fetch func(string) (Page[T], 
 	}
 }
 
-func selectImage(items []Image, in Input) (Image, error) {
-	if strings.TrimSpace(in.ImageID) != "" {
-		return exactImage(items, in.ImageID, in.CompartmentID)
-	}
-	items = keepImages(items, in)
-	if len(items) == 0 {
-		return Image{}, fail(KindNotFound, "image selection", "no compatible image found")
-	}
-	if len(items) > 1 && in.ImageName != "" {
-		return Image{}, fail(KindAmbiguous, "image selection", fmt.Sprintf("image name matched %d compatible images", len(items)))
-	}
-	if len(items) > 1 && in.ImageName == "" && in.OperatingSystem == "" && in.OSVersion == "" {
-		return Image{}, fail(KindAmbiguous, "image selection", fmt.Sprintf("found %d candidates; configure an explicit OCID or OS filters", len(items)))
-	}
-	// Newest platform images sort lexically by OCI display name; ID is the stable tie-breaker.
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].Name == items[j].Name {
-			return items[i].ID > items[j].ID
-		}
-		return items[i].Name > items[j].Name
+// ListImages returns all current shape-compatible OCI images, newest first.
+func ListImages(ctx context.Context, provider Provider, query Query) ([]Image, error) {
+	images, err := all(ctx, "images", func(page string) (Page[Image], error) {
+		return provider.Images(ctx, query, page)
 	})
-	return items[0], nil
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(images, func(i, j int) bool {
+		if images[i].CreatedAt.Equal(images[j].CreatedAt) {
+			return images[i].ID < images[j].ID
+		}
+		return images[i].CreatedAt.After(images[j].CreatedAt)
+	})
+	return images, nil
 }
 
 func selectShape(items []Shape, name string) (Shape, error) {
@@ -246,38 +232,40 @@ func selectShape(items []Shape, name string) (Shape, error) {
 	return shape, nil
 }
 
-func keepImages(items []Image, in Input) []Image {
-	out := items[:0]
-	name, operatingSystem, version := normalizeImageName(in.ImageName), normalizeImageName(in.OperatingSystem), normalizeImageName(in.OSVersion)
-	for _, x := range items {
-		if name != "" && !strings.Contains(normalizeImageName(x.Name), name) {
-			continue
+func selectImage(items []Image, id, compartmentID string) (Image, error) {
+	if strings.EqualFold(strings.TrimSpace(id), "ubuntu") {
+		var selected Image
+		bestMajor, bestMinor := -1, -1
+		for _, image := range items {
+			major, minor, ok := ubuntuVersion(image.OSVersion)
+			if image.OperatingSystem == "Canonical Ubuntu" && ok && (major > bestMajor || major == bestMajor && minor > bestMinor) {
+				selected, bestMajor, bestMinor = image, major, minor
+			}
 		}
-		if (operatingSystem == "" || strings.Contains(normalizeImageName(x.OperatingSystem), operatingSystem)) && (version == "" || strings.Contains(normalizeImageName(x.OSVersion), version)) {
-			out = append(out, x)
+		if selected.ID != "" {
+			return selected, nil
 		}
+		return Image{}, fail(KindNotFound, "image selection", "no compatible Ubuntu image was found; run `ocihood images list` and check the available images")
 	}
-	return out
-}
-
-func normalizeImageName(value string) string {
-	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			return unicode.ToLower(r)
-		}
-		return ' '
-	}, value)), " ")
-}
-
-func exactImage(items []Image, id, compartmentID string) (Image, error) {
 	for _, x := range items {
 		// Public platform images have no owning compartment in OCI responses.
 		if x.ID == id && (x.CompartmentID == "" || x.CompartmentID == compartmentID) {
 			return x, nil
 		}
 	}
-	return Image{}, fail(KindNotFound, "image selection", "explicit image is unavailable or incompatible")
+	return Image{}, fail(KindNotFound, "image selection", fmt.Sprintf("image_id %q was not found for the configured compartment and shape; run `ocihood images list` and check the value", id))
 }
+
+func ubuntuVersion(value string) (int, int, bool) {
+	majorText, minorText, ok := strings.Cut(value, ".")
+	if !ok || strings.ContainsAny(value, " \t") {
+		return 0, 0, false
+	}
+	major, majorErr := strconv.Atoi(majorText)
+	minor, minorErr := strconv.Atoi(minorText)
+	return major, minor, majorErr == nil && minorErr == nil
+}
+
 func selectVCN(items []VCN, in Input) (VCN, error) {
 	candidates := make([]VCN, 0)
 	for _, x := range items {

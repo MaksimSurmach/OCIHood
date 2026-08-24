@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/MaksimSurmach/OCIHood/internal/app"
@@ -26,6 +27,7 @@ import (
 type Runner interface {
 	Run(context.Context, app.Request) (app.Result, error)
 	Plan(context.Context, app.Request) (app.Plan, error)
+	Images(context.Context, app.Request) (app.ImageList, error)
 }
 
 // Execute runs the CLI and returns its process exit code.
@@ -128,6 +130,7 @@ func newRootCommand(runner Runner) *cobra.Command {
 	plan.Example = "  ocihood plan --account personal --output=json"
 	_ = plan.MarkFlagRequired("account")
 	root.AddCommand(plan)
+	root.AddCommand(newImagesCommand(runner, &configPath))
 	root.AddCommand(newConfigCommand(&configPath))
 	root.AddCommand(newStatusCommand(&configPath))
 
@@ -136,6 +139,70 @@ func newRootCommand(runner Runner) *cobra.Command {
 
 const resultSchema = "ocihood.start/v1"
 const planSchema = "ocihood.plan/v1"
+const imageListSchema = "ocihood.images/v1"
+
+type imageOutput struct {
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	OperatingSystem string    `json:"operating_system"`
+	OSVersion       string    `json:"os_version"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+type imageListOutputDocument struct {
+	Schema  string        `json:"schema"`
+	Account string        `json:"account"`
+	Region  string        `json:"region"`
+	Shape   string        `json:"shape"`
+	Images  []imageOutput `json:"images"`
+}
+
+func newImagesCommand(runner Runner, configPath *string) *cobra.Command {
+	var account, output string
+	var values imageListValues
+	images := &cobra.Command{Use: "images", Short: "Inspect current OCI images", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() }}
+	list := &cobra.Command{
+		Use: "list", Short: "List current images compatible with the configured shape", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if output != "text" && output != "json" {
+				return fmt.Errorf("invalid --output %q", output)
+			}
+			overrides, configless := values.overrides(cmd)
+			result, err := runner.Images(cmd.Context(), app.Request{ConfigPath: *configPath, Account: account, Overrides: overrides, Configless: *configPath == "" && configless})
+			if err != nil {
+				return fmt.Errorf("list images: %w", err)
+			}
+			document := imageListOutputDocument{Schema: imageListSchema, Account: result.Account, Region: result.Region, Shape: result.Shape, Images: make([]imageOutput, len(result.Images))}
+			for i, image := range result.Images {
+				document.Images[i] = imageOutput{ID: image.ID, Name: image.Name, OperatingSystem: image.OperatingSystem, OSVersion: image.OSVersion, CreatedAt: image.CreatedAt}
+			}
+			if output == "json" {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(document)
+			}
+			writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
+			if _, err := fmt.Fprintln(writer, "ID\tNAME\tOPERATING_SYSTEM\tOS_VERSION\tCREATED_AT"); err != nil {
+				return err
+			}
+			for _, image := range document.Images {
+				created := "-"
+				if !image.CreatedAt.IsZero() {
+					created = image.CreatedAt.UTC().Format(time.RFC3339)
+				}
+				if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", image.ID, image.Name, image.OperatingSystem, image.OSVersion, created); err != nil {
+					return err
+				}
+			}
+			return writer.Flush()
+		},
+	}
+	list.Flags().StringVar(&account, "account", "", "account name")
+	list.Flags().StringVar(&output, "output", "text", "output format: text or json")
+	values.bind(list)
+	list.Example = "  ocihood images list --account personal --shape VM.Standard.A1.Flex"
+	_ = list.MarkFlagRequired("account")
+	images.AddCommand(list)
+	return images
+}
 
 type planInstance struct {
 	ID        string `json:"id"`
@@ -341,7 +408,7 @@ func renderInstances(instances []reconcile.Instance) string {
 
 type startValues struct {
 	ociConfig, ociProfile, region, sshPublicKey, sshPrivateKey string
-	compartment, image, imageName, operatingSystem, osVersion  string
+	compartment, image                                         string
 	vcnID, vcnName, subnetID, subnetName, stateDir, logDir     string
 	shape                                                      string
 	ocpus, memoryGB, bootVolumeGB                              int
@@ -357,10 +424,7 @@ func (v *startValues) bind(command *cobra.Command) {
 	f.StringVar(&v.sshPublicKey, "ssh-public-key", "", "SSH public key file reference")
 	f.StringVar(&v.sshPrivateKey, "ssh-private-key", "", "SSH private key file reference")
 	f.StringVar(&v.compartment, "compartment-id", "", "target compartment OCID")
-	f.StringVar(&v.image, "image-id", "", "image OCID")
-	f.StringVar(&v.imageName, "image-name", "", "case-insensitive image name selector")
-	f.StringVar(&v.operatingSystem, "operating-system", "", "image operating system selector")
-	f.StringVar(&v.osVersion, "os-version", "", "image operating system version selector")
+	f.StringVar(&v.image, "image-id", "", "image OCID or reserved value ubuntu")
 	f.StringVar(&v.vcnID, "vcn-id", "", "VCN OCID")
 	f.StringVar(&v.vcnName, "vcn-name", "", "VCN name selector")
 	f.StringVar(&v.subnetID, "subnet-id", "", "subnet OCID")
@@ -404,9 +468,6 @@ func (v startValues) overrides(command *cobra.Command) (config.Overrides, bool) 
 	setString("ssh-private-key", v.sshPrivateKey, &o.SSHPrivateKeyPath)
 	setString("compartment-id", v.compartment, &o.CompartmentID)
 	setString("image-id", v.image, &o.ImageID)
-	setString("image-name", v.imageName, &o.ImageName)
-	setString("operating-system", v.operatingSystem, &o.OperatingSystem)
-	setString("os-version", v.osVersion, &o.OSVersion)
 	setString("vcn-id", v.vcnID, &o.VCNID)
 	setString("vcn-name", v.vcnName, &o.VCNName)
 	setString("subnet-id", v.subnetID, &o.SubnetID)
@@ -424,6 +485,35 @@ func (v startValues) overrides(command *cobra.Command) (config.Overrides, bool) 
 	setDuration("retry-min", v.retryMin, &o.Settings.RetryMin)
 	setDuration("retry-max", v.retryMax, &o.Settings.RetryMax)
 	return o, any
+}
+
+type imageListValues struct {
+	ociConfig, ociProfile, region, compartment, shape string
+}
+
+func (v *imageListValues) bind(command *cobra.Command) {
+	f := command.Flags()
+	f.StringVar(&v.ociConfig, "oci-config", "", "OCI SDK config path (default ~/.oci/config)")
+	f.StringVar(&v.ociProfile, "oci-profile", "", "OCI SDK profile (default DEFAULT)")
+	f.StringVar(&v.region, "region", "", "OCI region override")
+	f.StringVar(&v.compartment, "compartment-id", "", "image compartment OCID")
+	f.StringVar(&v.shape, "shape", "", "compatible compute shape")
+}
+
+func (v imageListValues) overrides(command *cobra.Command) (config.Overrides, bool) {
+	f, any := command.Flags(), false
+	set := func(name, value string, target **string) {
+		if f.Changed(name) {
+			*target, any = &value, true
+		}
+	}
+	var overrides config.Overrides
+	set("oci-config", v.ociConfig, &overrides.OCIConfigPath)
+	set("oci-profile", v.ociProfile, &overrides.OCIProfile)
+	set("region", v.region, &overrides.Region)
+	set("compartment-id", v.compartment, &overrides.CompartmentID)
+	set("shape", v.shape, &overrides.Settings.Shape)
+	return overrides, any
 }
 
 func newStatusCommand(configPath *string) *cobra.Command {
