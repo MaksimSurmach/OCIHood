@@ -62,13 +62,17 @@ func (p *Provider) Shapes(ctx context.Context, q domain.Query, page string) (dom
 	return domain.Page[domain.Shape]{Items: items, Next: value(r.OpcNextPage)}, nil
 }
 func (p *Provider) Images(ctx context.Context, q domain.Query, page string) (domain.Page[domain.Image], error) {
-	r, err := p.compute.ListImages(ctx, core.ListImagesRequest{CompartmentId: common.String(q.CompartmentID), Shape: optional(q.Shape), OperatingSystem: optional(q.OperatingSystem), OperatingSystemVersion: optional(q.OSVersion), Page: optional(page), LifecycleState: core.ImageLifecycleStateAvailable})
+	r, err := p.compute.ListImages(ctx, core.ListImagesRequest{CompartmentId: common.String(q.CompartmentID), Shape: optional(q.Shape), Page: optional(page), LifecycleState: core.ImageLifecycleStateAvailable})
 	if err != nil {
 		return domain.Page[domain.Image]{}, err
 	}
 	items := make([]domain.Image, 0, len(r.Items))
 	for _, x := range r.Items {
-		items = append(items, domain.Image{ID: value(x.Id), Name: value(x.DisplayName), CompartmentID: value(x.CompartmentId), OperatingSystem: value(x.OperatingSystem), OSVersion: value(x.OperatingSystemVersion)})
+		image := domain.Image{ID: value(x.Id), Name: value(x.DisplayName), CompartmentID: value(x.CompartmentId), OperatingSystem: value(x.OperatingSystem), OSVersion: value(x.OperatingSystemVersion)}
+		if x.TimeCreated != nil {
+			image.CreatedAt = x.TimeCreated.Time
+		}
+		items = append(items, image)
 	}
 	return domain.Page[domain.Image]{Items: items, Next: value(r.OpcNextPage)}, nil
 }

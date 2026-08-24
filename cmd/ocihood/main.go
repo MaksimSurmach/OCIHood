@@ -50,8 +50,7 @@ func main() {
 		return discovery.Discover(ctx, ocidiscovery.New(clients), discovery.Input{
 			Account: effective.Account, TenancyID: clients.TenancyOCID, CompartmentID: effective.CompartmentID,
 			Region: clients.Region, Shape: effective.Shape, OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB,
-			BootVolumeGB: effective.BootVolumeGB, ImageID: effective.ImageID, ImageName: effective.ImageName, OperatingSystem: effective.OperatingSystem,
-			OSVersion: effective.OSVersion, VCNID: effective.VCNID, VCNName: effective.VCNName,
+			BootVolumeGB: effective.BootVolumeGB, ImageID: effective.ImageID, VCNID: effective.VCNID, VCNName: effective.VCNName,
 			SubnetID: effective.SubnetID, SubnetName: effective.SubnetName, PublicIP: effective.PublicIP,
 		})
 	}, func(ctx context.Context, bootstrapper provisioner.Bootstrapper, effective config.Effective, discovered discovery.Result, once bool) (capacity.Result, error) {
@@ -75,6 +74,14 @@ func main() {
 		}
 		watcher := capacity.Watcher{Client: capacity.BreakerClient{Client: ocicapacity.New(clients), Circuit: circuit}, Store: store, Sleeper: capacity.TimerSleeper{}, Random: capacity.CryptoRandom{}, Logger: runner.Logger(), Now: time.Now, Config: capacity.Config{RequestTimeout: effective.RequestTimeout, InitialInterval: effective.RetryMin, MaxInterval: effective.RetryMax, Jitter: .2}}
 		return watcher.Watch(ctx, capacity.Input{TargetID: discovered.TargetID, TenancyID: discovered.TenancyID, Shape: effective.Shape, AvailabilityDomains: discovered.AvailabilityDomains, OCPUs: effective.OCPUs, MemoryGB: effective.MemoryGB, Resume: resume, Once: once})
+	})
+	runner.SetImageList(func(ctx context.Context, bootstrapper provisioner.Bootstrapper, effective config.Effective) (string, []discovery.Image, error) {
+		clients, ok := bootstrapper.(*auth.Clients)
+		if !ok {
+			return "", nil, fmt.Errorf("authenticated provider has unsupported type %T", bootstrapper)
+		}
+		images, err := discovery.ListImages(ctx, ocidiscovery.New(clients), discovery.Query{CompartmentID: effective.CompartmentID, Shape: effective.Shape})
+		return clients.Region, images, err
 	})
 	runner.SetLaunch(func(ctx context.Context, bootstrapper provisioner.Bootstrapper, effective config.Effective, discovered discovery.Result, decision reconcile.Decision, placement capacity.Result, sshKey string) (launch.Instance, error) {
 		clients, ok := bootstrapper.(*auth.Clients)

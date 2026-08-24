@@ -28,6 +28,7 @@ type fakeRunner struct {
 	request app.Request
 	result  app.Result
 	plan    app.Plan
+	images  app.ImageList
 	err     error
 	run     func(context.Context, app.Request) (app.Result, error)
 }
@@ -36,6 +37,40 @@ func (f *fakeRunner) Plan(_ context.Context, request app.Request) (app.Plan, err
 	f.calls++
 	f.request = request
 	return f.plan, f.err
+}
+
+func (f *fakeRunner) Images(_ context.Context, request app.Request) (app.ImageList, error) {
+	f.calls++
+	f.request = request
+	return f.images, f.err
+}
+
+func TestImagesListRendersTextAndJSON(t *testing.T) {
+	created := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	runner := &fakeRunner{images: app.ImageList{Account: "personal", Region: "eu-paris-1", Shape: "VM.Standard.A1.Flex", Images: []discovery.Image{{ID: "image-1", Name: "Oracle-Linux-9", OperatingSystem: "Oracle Linux", OSVersion: "9", CreatedAt: created}}}}
+	var textOutput, jsonOutput, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"--config", "config.yaml", "images", "list", "--account", "personal"}, runner, &textOutput, &stderr); code != 0 {
+		t.Fatalf("text code=%d stderr=%q", code, stderr.String())
+	}
+	for _, want := range []string{"ID", "image-1", "Oracle-Linux-9", "Oracle Linux", "2026-08-14T12:00:00Z"} {
+		if !strings.Contains(textOutput.String(), want) {
+			t.Fatalf("text output missing %q: %s", want, textOutput.String())
+		}
+	}
+	stderr.Reset()
+	if code := Execute(t.Context(), []string{"images", "list", "--account", "personal", "--oci-profile", "DEFAULT", "--compartment-id", "compartment", "--shape", "shape", "--output=json"}, runner, &jsonOutput, &stderr); code != 0 {
+		t.Fatalf("JSON code=%d stderr=%q", code, stderr.String())
+	}
+	var document imageListOutputDocument
+	if err := json.Unmarshal(jsonOutput.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Schema != imageListSchema || document.Region != "eu-paris-1" || len(document.Images) != 1 || document.Images[0].ID != "image-1" {
+		t.Fatalf("document=%+v", document)
+	}
+	if runner.request.Account != "personal" || !runner.request.Configless || runner.request.Overrides.OCIProfile == nil || *runner.request.Overrides.OCIProfile != "DEFAULT" || runner.request.Overrides.CompartmentID == nil || *runner.request.Overrides.CompartmentID != "compartment" || runner.request.Overrides.Settings.Shape == nil || *runner.request.Overrides.Settings.Shape != "shape" {
+		t.Fatalf("request=%+v", runner.request)
+	}
 }
 
 func TestPlanCommandRendersDeterministicIntent(t *testing.T) {
@@ -367,6 +402,7 @@ func TestHelpDoesNotRunApplication(t *testing.T) {
 	}{
 		{name: "root help", args: []string{"--help"}, want: "Available Commands:"},
 		{name: "start help", args: []string{"start", "--help"}, want: "Start one provisioning run"},
+		{name: "images help", args: []string{"images", "--help"}, want: "Inspect current OCI images"},
 		{name: "bare root", want: "Available Commands:"},
 	}
 
@@ -526,6 +562,9 @@ func (r *loggingRunner) Run(context.Context, app.Request) (app.Result, error) {
 	return r.result, nil
 }
 func (*loggingRunner) Plan(context.Context, app.Request) (app.Plan, error) { return app.Plan{}, nil }
+func (*loggingRunner) Images(context.Context, app.Request) (app.ImageList, error) {
+	return app.ImageList{}, nil
+}
 
 func TestStartExitCodesAndSecretRedaction(t *testing.T) {
 	t.Parallel()
@@ -540,7 +579,8 @@ func TestStartExitCodesAndSecretRedaction(t *testing.T) {
 		{name: "transient", err: &app.Error{Phase: "capacity", Err: &capacity.Error{Kind: capacity.Transient, Err: errors.New(secret)}}, code: 4, want: "transient"},
 		{name: "canceled", err: context.Canceled, code: 130, want: "canceled"},
 		{name: "deadline", err: context.DeadlineExceeded, code: 124, want: "deadline"},
-		{name: "invalid image selector", err: &app.Error{Phase: "discovery", Err: &discovery.Error{Kind: discovery.KindInvalid, Stage: "image selection", Err: errors.New("image selector is required")}}, code: 2, want: "invalid"},
+		{name: "missing image ID", err: &app.Error{Phase: "discovery", Err: &discovery.Error{Kind: discovery.KindInvalid, Stage: "image selection", Err: errors.New("image_id is required; run `ocihood images list` and check the value")}}, code: 2, want: "ocihood images list"},
+		{name: "unknown image ID", err: &app.Error{Phase: "discovery", Err: &discovery.Error{Kind: discovery.KindNotFound, Stage: "image selection", Err: errors.New("image_id \"missing\" was not found; run `ocihood images list` and check the value")}}, code: 1, want: "was not found"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -560,6 +600,7 @@ func TestInvalidExecutionModesDoNotRunApplication(t *testing.T) {
 		{"start", "--account", "personal", "--log-format=yaml"},
 		{"start", "--account", "personal", "--log-level=noisy"},
 		{"start", "--account", "personal", "--max-runtime=-1s"},
+		{"images", "list", "--account", "personal", "--output=yaml"},
 	} {
 		runner := &fakeRunner{}
 		if code := Execute(t.Context(), args, runner, &bytes.Buffer{}, &bytes.Buffer{}); code == 0 || runner.calls != 0 {
@@ -576,7 +617,11 @@ func TestInvalidInputDoesNotRunApplication(t *testing.T) {
 	}{
 		{name: "unknown command", args: []string{"missing"}, want: "unknown command"},
 		{name: "unknown flag", args: []string{"start", "--account", "personal", "--missing"}, want: "unknown flag"},
+		{name: "removed image name", args: []string{"start", "--account", "personal", "--image-name", "Oracle Linux"}, want: "unknown flag"},
+		{name: "removed operating system", args: []string{"plan", "--account", "personal", "--operating-system", "Oracle Linux"}, want: "unknown flag"},
+		{name: "removed OS version", args: []string{"plan", "--account", "personal", "--os-version", "9"}, want: "unknown flag"},
 		{name: "missing account", args: []string{"start"}, want: "required flag"},
+		{name: "missing images account", args: []string{"images", "list"}, want: "required flag"},
 	}
 
 	for _, tt := range tests {
