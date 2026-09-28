@@ -479,3 +479,261 @@ Provide an explicit opt-in managed OCI networking path for users who do not alre
 
 ---
 
+## Problem 21 — Package and release OCIHood binary and container
+
+**Status:** Todo
+
+### Problem
+
+Package OCIHood as reproducible versioned binaries and a multi-arch container with release automation that verifies the produced artifacts rather than only building them.
+
+### Task
+
+* Add `ocihood version` that reports semantic version, commit SHA and build metadata from injected build-time values; development builds must be distinguishable from tagged releases.
+* Produce release binaries for supported Linux amd64/arm64 targets. Add macOS amd64/arm64 only if those platforms remain supported by the runtime/features at release time.
+* Use a minimal release tool/workflow such as GoReleaser; keep release automation separate from normal PR CI.
+* Tagged semantic-version releases (`vX.Y.Z`) publish archives/binaries and checksums to GitHub Releases.
+* Build/publish a multi-arch container image to GHCR matching the release version.
+* Container must run as a normal foreground CLI/daemon process and accept configuration/OCI credential/SSH key/state mounts rather than baking user data into the image.
+* Document image tags. A release version tag must be immutable; `latest` behavior, if used, must be explicit and must not point to prereleases unintentionally.
+* Produced artifacts must not contain user credentials/configuration or repository-local secrets.
+* Release workflow must fail if artifact smoke tests fail.
+* Prefer reproducible/static-enough Go builds appropriate for the codebase; any CGO/platform requirement must be explicit rather than accidental.
+
+---
+
+## Problem 22 — Validate OCIHood against real OCI with opt-in smoke and E2E tests
+
+**Status:** Todo
+
+### Problem
+
+Provide a controlled opt-in real-OCI validation layer before the first OCIHood release so mocked/unit tests cannot hide SDK, IAM, request-shape or lifecycle differences in the actual OCI service.
+
+### Task
+
+* Keep all real-OCI tests opt-in. They must never run automatically for ordinary pull requests or forks.
+* Use dedicated test configuration/credentials and an explicitly isolated test compartment/target identity where mutating tests are enabled.
+* Separate read-only smoke tests from mutating provisioning E2E tests.
+* Read-only smoke coverage must validate at least real authentication, tenancy/region/AD discovery, image/network discovery and capacity-report behavior where the account/region supports it.
+* Mutating E2E coverage must exercise one controlled `ocihood start` flow through real `LaunchInstance`, lifecycle reconciliation and final state using a uniquely identifiable disposable test TargetID.
+* A mutating test must first verify its isolation/ownership markers and must refuse to modify/delete unrelated resources.
+* Live tests must use explicit bounded timeouts/max-runtime and must not poll OCI aggressively.
+* Record sanitized diagnostics sufficient to debug SDK/service failures without leaking credentials.
+* Re-run/idempotency validation must prove a second execution for the same active test TargetID does not create a second active instance.
+* Exercise at least one restart/reconciliation scenario against real provider state where practical.
+* Cleanup, if provided, must target only resources proven to be created/owned by the test identity and must require explicit opt-in; cleanup failure must be reported rather than broadening deletion scope.
+* Document required IAM permissions, expected possible cost/free-tier impact and exact commands/environment variables for running read-only versus mutating suites.
+
+---
+
+## Problem 23 — Add OCI SDK HTTP contract integration test harness
+
+**Status:** Done
+
+### Problem
+
+Close the gap between interface-level fake tests and real OCI by exercising OCIHood through the real Oracle OCI Go SDK against a fully local fake OCI HTTP service.
+
+This suite must verify request serialization, response/error handling and production provider wiring without requiring OCI credentials, network access or cloud resources.
+
+### Task
+
+* Provide a reusable local fake OCI HTTP server/test harness that can serve Identity, Compute and Virtual Network API responses required by OCIHood.
+* Production OCI SDK clients must be pointed at the local server; do not bypass the SDK with fake provider interfaces for these tests.
+* Exercise the real provider adapters used by `ocihood start`/`plan` through SDK request/response serialization.
+* Support deterministic scripted responses, pagination and request capture.
+* Verify OCI request paths, query parameters, JSON bodies and relevant headers such as `opc-retry-token`.
+* Cover OCI service error classification for 401/403/404/409/429 and representative 5xx responses.
+* Cover throttling/Retry-After behavior and malformed/unexpected responses.
+* Requests must remain context-cancellable and respect configured request timeouts.
+* The harness must never require or load real OCI credentials and must never make external network calls.
+* Keep this layer separate from Problem 22 live OCI tests.
+
+---
+
+## Problem 24 — Validate crash-safe provisioning across every launch boundary
+
+**Status:** Done
+
+### Problem
+
+Prove that OCIHood remains idempotent and never creates duplicate managed instances when the process crashes or loses responses at any critical provisioning boundary.
+
+The invariant is: for one account/TargetID, restart/reconciliation must converge safely and the number of active OCIHood-owned instances must never exceed one.
+
+### Task
+
+* Add deterministic failure/crash injection points around reconciliation, state persistence, capacity handling, launch acceptance and lifecycle completion.
+* Exercise the compiled/application production orchestration path rather than only pure reconciliation functions.
+* Simulate ambiguous provider outcomes where LaunchInstance may have succeeded but OCIHood did not receive or persist the response.
+* Restart from the exact durable state left by the interrupted run and reconcile against provider observations.
+* Verify retry-token/AttemptID continuity where the same logical launch attempt must be retried.
+* Verify a new attempt is created only where the reconciliation contract proves it is safe.
+* Concurrent duplicate runners for the same account/TargetID must not produce competing launch writes.
+* The suite must be deterministic and run without real sleeps.
+
+---
+
+## Problem 25 — Add provisioning safety and resource policy guardrails
+
+**Status:** Done
+
+### Problem
+
+Prevent accidental provisioning of an unexpectedly large or chargeable OCI resource configuration while keeping OCIHood independent from volatile Oracle pricing/free-tier limits.
+
+### Task
+
+* Introduce an explicit local resource safety policy covering at least allowed shapes, maximum OCPUs, memory and boot-volume size.
+* Keep policy limits configurable; do not hard-code current Oracle Free Tier limits as permanent product truth.
+* `ocihood plan` must show whether the resolved target is within the configured safety policy and why.
+* Foreground interactive execution may require explicit acknowledgement when policy is exceeded; unattended/daemon execution must require an explicit preconfigured opt-in and must never silently accept an override.
+* OCIHood must never automatically increase shape, OCPUs, memory or boot volume while searching for capacity.
+* Policy checks happen before any mutating OCI call.
+* CLI/config precedence must remain deterministic and machine-readable output must expose the sanitized policy decision.
+* Policy failures must not leak credentials or secret references.
+
+---
+
+## Problem 26 — Add `ocihood doctor` environment and OCI readiness diagnostics
+
+**Status:** Backlog
+
+### Problem
+
+Give users one safe diagnostic command that validates local configuration and read-only OCI readiness before they start a long-running provisioning session.
+
+### Task
+
+* Add `ocihood doctor --account <name>` using the same effective config/auth/discovery components as production execution where applicable.
+* Report individual checks with stable identifiers and status: pass, warning, fail, skipped.
+* Validate at least config resolution, OCI config/profile, private-key reference readability, SSH public-key reference, OCI authentication, region/tenancy, compartment access, AD discovery, image resolution, VCN/subnet usability, state directory readability/writability and capacity-report support/permission.
+* Never perform LaunchInstance or any other mutating OCI operation.
+* Distinguish optional/degraded conditions such as unavailable Capacity Report from blocking failures.
+* Support human-readable and JSON output using the same typed result model/format conventions from Problem 11.
+* Return documented process exit categories suitable for scripts.
+* Redact credentials, private-key contents, tokens and secret-bearing paths/values where appropriate.
+* Keep each check independently testable and do not let one failed optional check hide subsequent safe diagnostics where continuing is meaningful.
+
+---
+
+## Problem 27 — Define durable state compatibility and migration policy
+
+**Status:** Todo
+
+### Problem
+
+Make durable state upgrades predictable once users begin running released OCIHood versions for long periods.
+
+### Task
+
+* Define a documented compatibility policy for persisted state schema versions.
+* Add explicit migration support when a future schema change requires transforming supported older state.
+* Never treat an unsupported/newer/corrupt state file as empty state or permission to launch a new instance.
+* Migration must preserve ownership identity, TargetID, AttemptID/retry-token semantics, lifecycle and scheduling/pause intent where present.
+* Before an in-place migration, preserve a recoverable backup or use an atomic migration strategy that leaves the old valid state intact on failure.
+* Make migration idempotent and safe under process interruption.
+* Define downgrade behavior explicitly; fail safely when a binary cannot understand newer state.
+* Keep secrets out of state and migration logs.
+* Maintain golden fixtures for released state schema versions once public releases begin.
+
+---
+
+## Problem 28 — Harden OCIHood release supply chain and security checks
+
+**Status:** Todo
+
+### Problem
+
+Add practical security and software-supply-chain controls appropriate for a public cloud automation tool and its published binaries/container images.
+
+### Task
+
+* Add `govulncheck` to an appropriate CI/security workflow and fail on actionable vulnerabilities affecting built code according to a documented policy.
+* Enable CodeQL or an equivalent static security analysis workflow for Go.
+* Add automated dependency update configuration with controlled grouping/cadence rather than uncontrolled churn.
+* Generate an SBOM for release artifacts/container images.
+* Produce verifiable release provenance/signatures using GitHub-native keyless signing/attestations or another minimal maintained approach.
+* Keep workflow token permissions least-privilege and separate PR validation permissions from release publishing permissions.
+* Pin or otherwise intentionally control third-party GitHub Actions used in security/release-sensitive workflows.
+* Document vulnerability reporting and supported-version expectations in SECURITY.md.
+* Security checks must not expose OCI credentials, release tokens or repository secrets in logs/artifacts.
+
+---
+
+## Problem 29 — Prepare OCIHood repository for public open-source launch
+
+**Status:** Todo
+
+### Problem
+
+Turn the technically public repository into a clear, trustworthy and contributor-friendly open-source project ready for a first public release.
+
+### Task
+
+### README and product positioning
+
+* Rewrite the top of README around the user problem, value proposition and a minimal quick start before internal architecture details.
+* Show the main capabilities concisely: safe capacity waiting, AD rotation, retries/backoff, crash-safe reconciliation/idempotency, supported execution modes, notifications when available and binary/container installation.
+* Include a realistic minimal usage example and links to deeper documentation.
+* Move deep TargetID/state/reconciliation details into dedicated architecture documentation where appropriate.
+* Add an explicit independent-project disclaimer: OCIHood is not affiliated with or endorsed by Oracle Corporation.
+
+### Documentation
+
+Add/organize at least:
+
+* `docs/quick-start.md`;
+* `docs/configuration.md`;
+* `docs/architecture.md`;
+* `docs/iam.md` with least-privilege-oriented OCI permissions for read-only and provisioning paths;
+* `docs/troubleshooting.md`;
+* `docs/development.md`;
+* safe examples for minimal config, multi-account config, Docker and systemd when those features exist.
+
+Documentation commands/config examples must be validated in CI where practical so examples do not silently rot.
+
+### Community/repository files
+
+Add at least:
+
+* `CONTRIBUTING.md`;
+* `SECURITY.md`;
+* `CODE_OF_CONDUCT.md`;
+* `SUPPORT.md` or equivalent support expectations;
+* structured bug and feature issue templates;
+* pull request template.
+
+### GitHub presentation
+
+* Set a useful repository description.
+* Add relevant topics such as `oracle-cloud`, `oci`, `oracle-cloud-infrastructure`, `free-tier`, `golang`, `provisioning`, `automation`, `cli`, `devops`.
+* Decide and document whether GitHub Discussions is enabled; if enabled, define what belongs there versus Issues.
+* Add a simple original OCIHood visual identity/logo that does not use Oracle trademarks/logos or imply affiliation.
+* Add appropriate CI/release/security badges only when they link to real maintained workflows.
+
+---
+
+## Problem 30 — Add ownership-guarded destroy lifecycle for managed resources
+
+**Status:** Backlog
+
+### Problem
+
+Provide an explicit destructive lifecycle command for resources that OCIHood can prove it owns, primarily for controlled cleanup and future operational workflows.
+
+### Task
+
+* Add an explicit `ocihood destroy --account <name>` flow; never destroy as a side effect of normal start/reconciliation.
+* Resolve the exact TargetID and require complete OCIHood ownership tags/identity before any destructive call.
+* Never select resources for deletion by display name alone.
+* Refuse on zero, ambiguous or conflicting owned matches unless the command semantics explicitly and safely resolve the case.
+* Show a deterministic destruction plan before mutation.
+* Require explicit confirmation for interactive use and explicit non-interactive opt-in for automation.
+* Poll deletion/termination to a documented terminal state with bounded timeout/cancellation.
+* Update/remove local state only after provider outcome is safely known; ambiguous deletion outcomes must remain reconcilable.
+* Cleanup of managed networking, if ever supported, must be separately ownership-guarded and dependency-aware; do not delete user-owned networking.
+
+---
+
