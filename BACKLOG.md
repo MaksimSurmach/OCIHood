@@ -238,3 +238,244 @@ Allow a complete OCIHood provisioning run without a project YAML file by exposin
 
 ---
 
+## Problem 11 — Add foreground, one-shot and machine-readable execution modes
+
+**Status:** Done
+
+### Problem
+
+Make OCIHood usable both by humans and automation with predictable foreground, one-shot, bounded-runtime and machine-readable behavior.
+
+### Task
+
+* Keep normal `ocihood start` as foreground long-running mode with concise human-readable progress logs.
+* Add `--once`: perform exactly one discovery/reconciliation/capacity/provision decision cycle and then exit. It must not enter the indefinite watcher loop.
+* Add `--max-runtime <duration>` that cancels the run through context when the configured runtime expires.
+* Add `--log-level` and `--log-format text|json` for diagnostics.
+* Add `--output text|json` for the final command result independently of log format.
+* Preserve stdout/stderr contract: final command result only on stdout; logs/diagnostics only on stderr.
+* Define and document stable typed result categories and process exit-code mapping for at least: success/already-satisfied, no-capacity in one-shot mode, retryable/transient failure, fatal config/auth/provider error and cancellation/deadline.
+* JSON output must have a documented stable top-level schema/version and include enough fields to identify account/TargetID, outcome, instance identity/state/public IP where applicable and sanitized error category/message where applicable.
+* Human and JSON modes must represent the same underlying typed result; formatting must not change core behavior.
+* Cancellation/max-runtime must not convert an already completed success into failure after the fact.
+
+---
+
+## Problem 12 — Implement long-running daemon runtime and local control commands
+
+**Status:** Todo
+
+### Problem
+
+Add a first-class long-running daemon runtime that can manage configured OCIHood jobs and be inspected/controlled locally without coupling core provisioning to systemd.
+
+### Task
+
+* Add `ocihood daemon run` as a foreground daemon entrypoint suitable for a service manager.
+* Support multiple configured account/TargetID jobs in one process while isolating each job's context, state and failures.
+* Reuse the existing durable state/status model; do not create a second incompatible daemon-only state source.
+* Add a local-only control transport, preferably a Unix domain socket on Linux.
+* Socket/control endpoint must use restrictive local permissions and must not be exposed on a network interface by default.
+* Extend/reuse CLI controls for `status`, `pause`, `resume` and `stop` with optional account targeting.
+* Starting a second daemon against the same control/state scope must fail clearly rather than create competing controllers.
+* Detect/clean up a stale local socket only when it is safe to prove no live daemon owns it.
+* Pausing one account stops new watcher/launch work for that account without cancelling unrelated account jobs.
+* Resume continues from persisted/reconciled state rather than starting a fresh blind provisioning attempt.
+* Daemon shutdown cancels child jobs, waits for bounded cleanup/state flush and then exits.
+* Expose daemon PID/version/start time and per-account lifecycle/next-action state through status.
+* Control protocol requests/responses must be typed/versionable enough to reject malformed/unsupported requests cleanly.
+* Do not transmit or expose provider secrets through the local control protocol/status response.
+
+---
+
+## Problem 13 — Add systemd installation and service integration
+
+**Status:** Backlog
+
+### Problem
+
+Make the OCIHood daemon easy and safe to install/run under systemd without putting service-manager behavior into Provisioner core.
+
+### Task
+
+* Add `ocihood daemon install` that renders/installs a systemd unit using absolute executable/config/state/control paths.
+* Support an explicit service mode (system service and/or user service); do not silently guess when privileges/target differ.
+* Provide a documented way to install only versus install+enable+start (for example explicit `--enable`/`--now` semantics). The command behavior must be idempotent and documented.
+* Add `daemon uninstall`, `daemon service-status` and restart/start/stop helpers only where they add clear value beyond normal systemctl usage.
+* Use `Restart=on-failure` with sensible bounded restart behavior; SIGTERM must reach OCIHood for graceful shutdown.
+* Do not embed OCI credentials, Telegram tokens, proxy passwords or other secrets directly into the unit file/command line.
+* Validate referenced executable/config/state directories before installation and fail before partially installing an invalid unit when possible.
+* Correctly quote/escape filesystem paths in rendered unit configuration.
+* Run the required systemd daemon-reload/enable/start operations only when requested and surface failures clearly.
+* Uninstall must remove only OCIHood service-manager artifacts; user config/state/logs are preserved unless a separate explicit destructive option is ever added.
+* Repeated install/uninstall should be safe and predictable.
+* Document an equivalent manual unit for users who do not want CLI-managed installation.
+
+---
+
+## Problem 14 — Add scheduling windows, delayed start and pause-until controls
+
+**Status:** Backlog
+
+### Problem
+
+Add deterministic scheduling windows, delayed start and pause-until behavior shared by foreground and daemon execution.
+
+### Task
+
+* Add scheduling model for `start-at`, `stop-at`/`finish-at`, optional `max-runtime` and `pause-until`.
+* Accept unambiguous timestamps: RFC3339 with offset, or local wall time together with an explicit IANA timezone. Document the default timezone behavior when no zone is supplied.
+* Define boundary semantics explicitly: start time is inclusive; once stop/finish time is reached, no new capacity probe/launch attempt may begin.
+* If an OCI launch was already accepted before the stop deadline, do not destroy the instance merely because the window ended; finish only the reconciliation/state update needed to know the outcome.
+* `pause-until` suppresses new watcher/launch work for the selected job until the timestamp, then resumes automatically from persisted/reconciled state.
+* Foreground and daemon modes must use the same scheduling decision component.
+* Persist schedule/pause intent required to survive daemon restart.
+* Sleeping until start/pause/retry deadlines must be context-cancellable and use injectable clock/timer abstractions for tests.
+* `max-runtime` is measured from actual run start and composes predictably with absolute stop-at; the earliest applicable deadline wins.
+* Status must distinguish waiting-for-schedule, paused, waiting-for-capacity, running/provisioning and finished-window states, and show the next relevant timestamp.
+* Define behavior for expired windows, invalid ranges and daylight-saving ambiguous/nonexistent local times; never silently reinterpret an invalid local timestamp.
+
+---
+
+## Problem 15 — Add HTTP(S) and SOCKS5 proxy support
+
+**Status:** Backlog
+
+### Problem
+
+Allow OCI and notification traffic to use an explicitly configured HTTP(S) or SOCKS5 proxy without duplicating transport logic or leaking proxy credentials.
+
+### Task
+
+* Define one reusable outbound transport/proxy factory used by OCI SDK HTTP clients and notification HTTP clients.
+* Support HTTP proxy, HTTPS requests through an HTTP CONNECT-capable proxy and SOCKS5.
+* Support global proxy configuration plus per-account override.
+* Support `no_proxy`/bypass host rules with deterministic documented matching behavior.
+* Define precedence explicitly: CLI override (when provided by Problem 10) > per-account proxy > global proxy > no proxy. Standard environment proxy variables must not silently change behavior unless explicitly documented/enabled.
+* Allow proxy credentials to be referenced from environment/secret reference where practical; avoid encouraging raw password-bearing command-line arguments.
+* Validate proxy URL/scheme/credential-reference errors before the watcher starts where possible.
+* Redact userinfo/password/token data from logs, errors, status and effective-config output.
+* Context, request timeouts, OCI retry behavior and notifier behavior must continue to work through the proxy.
+* `no_proxy` bypassed hosts connect directly while non-bypassed hosts use the configured proxy.
+* No proxy remains the default and must produce the same behavior as before this feature.
+
+---
+
+## Problem 16 — Add interactive config builder and account wizard
+
+**Status:** Todo
+
+### Problem
+
+Provide an interactive `ocihood config init` builder that creates or updates a valid OCIHood configuration safely without requiring manual YAML editing.
+
+### Task
+
+* Add `ocihood config init` using the same typed config model/validation rules as non-interactive configuration.
+* Detect standard OCI config path/profile candidates and allow the user to choose or enter an explicit path/profile.
+* Prompt for account name, OCI profile/config path, SSH key reference, target resources, networking/image preferences, retry settings and optional feature configuration.
+* Show documented defaults and let Enter accept a default only when that default is valid for the field.
+* Validate individual input where practical and validate the complete effective configuration before writing anything.
+* Show a final redacted review summary before save.
+* Existing valid config must be loaded and preserved; adding/updating one account must not silently remove unrelated accounts/global settings/comments where preservation is feasible with the chosen YAML approach.
+* Never overwrite an existing named account with materially different values without explicit user confirmation.
+* Write updates atomically. If validation, cancellation, EOF or write fails, the previous config remains intact.
+* When replacing an existing file, create a documented backup or otherwise provide a safe recovery path before destructive replacement.
+* Secret/token values must not be echoed in prompts/review output/logs and should be stored as references rather than plaintext when supported by the config model.
+* In a non-interactive/non-TTY context, fail clearly and point users to config/CLI options rather than hanging for input.
+* Keep prompt/UI mechanics behind an interface so tests can drive the builder without a terminal and a future TUI can reuse the builder model.
+
+---
+
+## Problem 17 — Establish OCIHood repository engineering baseline and CI
+
+**Status:** Done
+
+### Problem
+
+Establish the repository quality baseline before feature development so every later PR is built and validated consistently.
+
+### Task
+
+* Use Go module `github.com/MaksimSurmach/OCIHood` and binary name `ocihood`.
+* Pin and document the supported Go version.
+* Establish the initial repository layout, including `cmd/ocihood` and `internal/`.
+* Add baseline repository files: `.gitignore`, README skeleton and license.
+* Use standard `log/slog` for application logging. Text is the default human-readable format; structured fields are preferred over formatted strings.
+* Operational logs and diagnostics go to stderr. Command result output goes to stdout.
+* Secrets, private keys, tokens and credential contents must never be logged.
+* Add GitHub Actions CI for pull requests and the default branch.
+* Keep build tooling intentionally small; do not introduce a large task/build framework without a concrete need.
+
+---
+
+## Problem 18 — Define desired-resource identity, idempotency and reconciliation model
+
+**Status:** Done
+
+### Problem
+
+Define and implement the small domain contract that lets OCIHood identify one logical desired instance and reconcile local intent with OCI safely across retries, crashes and ambiguous API outcomes.
+
+### Task
+
+* Define a deterministic stable `TargetID`. Its exact normalized inputs must be documented and tested; transient process data, retry counters and generated request IDs must not affect it.
+* Define deterministic OCI ownership markers/tags for managed instances, including a managed marker and stable target/account identity.
+* Discovery/reconciliation must never claim an unrelated instance solely because shape, region, display name or other non-ownership properties happen to match.
+* Define a logical launch `AttemptID` and OCI `opc-retry-token` lifecycle for an in-flight create attempt.
+* Reuse the same OCI retry token when retrying the same ambiguous logical create while the token remains valid/applicable; reconcile OCI state before generating a new logical attempt after ambiguity/expiry/conflict.
+* Define reconciliation decisions as typed outcomes such as: `create`, `already-satisfied`, `resume/reconcile`, `retry-same-attempt`, `new-attempt-safe`, `conflict/fail-safe`.
+* Reconciliation must consider both durable local state and provider-observed managed instances rather than trusting either side alone.
+* Multiple active managed matches for the same TargetID are a conflict and must never trigger another create automatically.
+* A terminated/deleted managed instance must not by itself satisfy the desired running target.
+* Document what identity/attempt fields belong in config, durable state and OCI tags.
+
+---
+
+## Problem 19 — Add provisioning plan and dry-run mode
+
+**Status:** Done
+
+### Problem
+
+Expose the exact resolved provisioning intent before any OCI write so users and tests can validate what OCIHood would do safely.
+
+### Task
+
+* Add `ocihood plan --account <name>` using the same effective config, authentication, identity and discovery code paths as `start`.
+* Build a typed Plan object that later provisioning can consume; do not maintain a separate planning-only interpretation of configuration.
+* The plan must show at least: account/TargetID, region, target compartment, shape/OCPU/memory, image, VCN/subnet, boot-volume/public-IP settings, candidate ADs, relevant managed-instance observations and intended action.
+* Intended action must distinguish at least `create`, `already-satisfied` and `blocked/conflict/ambiguous`.
+* `plan` is read-only. It may perform read-only provider calls but must never invoke resource create/update/delete APIs.
+* `plan` must not enter an indefinite capacity-wait loop. Capacity may be shown only as an instantaneous/read-only observation if later included.
+* Secrets/private-key/token contents are never rendered.
+* Optional `ocihood start --dry-run` may reuse the same Plan path; if implemented, it must be behaviorally equivalent to planning and perform zero writes.
+* Provider/config/discovery errors must fail the command rather than rendering a misleading successful plan.
+
+---
+
+## Problem 20 — Add optional managed OCI network setup
+
+**Status:** Backlog
+
+### Problem
+
+Provide an explicit opt-in managed OCI networking path for users who do not already have a suitable VCN/subnet, without mutating unrelated user networking.
+
+### Task
+
+* Existing-network discovery remains the default. Managed networking activates only through explicit configuration/CLI intent.
+* Never create a VCN/subnet merely because normal discovery returned no usable network.
+* Define the minimal managed public-network resource set required by the MVP: VCN, subnet, internet gateway, route to the internet gateway and the minimum required security policy/attachment model.
+* CIDRs and relevant network settings must have documented deterministic defaults and be configurable/validated before writes.
+* Apply OCIHood ownership identity/tags to every OCIHood-created network resource where OCI supports tagging.
+* Reconcile/reuse previously created OCIHood-managed network resources by identity on restart; never duplicate a partially created network stack blindly.
+* Detect partial/conflicting managed-network state and either complete the missing safe pieces or fail with an actionable conflict; never attach to similarly named unrelated resources.
+* User-owned existing VCN/subnet/security resources must not be modified, retagged or deleted by managed-network reconciliation.
+* Surface all intended network creates/reuses/conflicts in `ocihood plan` before mutation.
+* Public ingress policy must be explicit. Do not silently open broad inbound access such as SSH from `0.0.0.0/0`; if inbound SSH is requested, require/document the configured source CIDR/rule.
+* Managed networking must not open unrelated application ports by default.
+* No automatic network cleanup/destruction is implemented in this task.
+
+---
+
