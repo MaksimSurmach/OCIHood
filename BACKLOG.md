@@ -737,3 +737,184 @@ Provide an explicit destructive lifecycle command for resources that OCIHood can
 
 ---
 
+## Problem 31 — Add OCI API circuit breaker using a mature library
+
+**Status:** Done
+
+### Problem
+
+Prevent OCIHood from repeatedly hammering OCI during sustained provider/network failures while preserving the existing retry/backoff, AD rotation and reconciliation semantics.
+
+### Task
+
+* Introduce a small provider-independent breaker abstraction/configuration at the outbound OCI boundary; keep Cobra and business orchestration unaware of library-specific types.
+* Apply the breaker to repeated OCI API failures where fast-fail behavior is useful, including transport failures, timeouts, OCI 5xx/service-unavailable conditions and sustained throttling according to an explicit error-classification policy.
+* **Do not count normal domain outcomes as breaker failures.** In particular, `no capacity`, a valid empty result, expected not-found during reconciliation, validation/user errors and context cancellation must not trip the breaker.
+* Breaker-open must be represented as a retryable/degraded condition, never as permission to create a second instance and never as a fatal configuration error.
+* Preserve `Retry-After` and the existing bounded exponential backoff/jitter behavior. Avoid creating two independent retry loops; the breaker decides whether a call is allowed, while the existing watcher/retry orchestration remains responsible for when the next attempt happens.
+* Support normal closed -> open -> half-open -> closed recovery using the selected library.
+* Scope breakers so one failing OCI endpoint cannot be bypassed simply by rotating through ADs, while unrelated operation families are not unnecessarily blocked. At minimum document/test the chosen account/region/service/operation-family keying.
+* Keep thresholds/timeouts configurable with conservative defaults and strict validation. Configuration must have upper/lower safety bounds; zero/invalid values must not produce a busy loop.
+* Emit structured logs/observable state transitions for breaker open, half-open and recovered/closed. Do not log credentials or raw sensitive request data.
+* Circuit-breaker state is runtime protection only; durable provisioning identity/reconciliation state remains the source of truth after restart.
+
+---
+
+## Problem 32 — Make image selection, plan output, and resource defaults explicit
+
+**Status:** Done
+
+### Problem
+
+Make provisioning inputs deterministic and debuggable for real OCI runs.
+
+### Task
+
+#### Scope
+
+1. Image input has exactly one mode:
+   * explicit `image_id`: use that OCID directly, including public platform images;
+   * discovery by image/OS name and optional version: fuzzy, case-insensitive name matching, constrained by the target shape architecture.
+     Reject mixed or missing selectors with a stable validation error.
+2. Normalize error kinds/codes and user-facing messages. `no_capacity` and other terminal outcomes must not produce a blank `Error:`.
+3. Add `plan --output=json`. JSON must include the selected image OCID, display name, OS/version, shape architecture context, and resolved CPU/RAM/boot-disk/public-IP values.
+4. Keep resource values explicit and configurable: built-in defaults remain overridable through config and CLI; exact `shape`, `ocpus`, `memory_gb`, and `boot_volume_gb` must be visible in `plan` and covered by validation/policy.
+
+#### Acceptance criteria
+
+* Public OCI image with empty `compartment-id` is accepted when its OCID is explicitly selected.
+* Name discovery cannot select an image for the wrong shape architecture and returns deterministic not-found/ambiguous errors.
+* Text and JSON plan show the same resolved image/resource values.
+* Missing/mixed image selectors fail before OCI mutation with stable, non-empty diagnostics.
+* Tests cover selector precedence/validation, public exact-image selection, fuzzy name selection, plan JSON, and non-empty terminal errors.
+* Existing CLI/config behavior and read-only plan remain backward compatible where not contradicted above.
+
+#### Evidence
+
+Live OCI smoke used `Canonical-Ubuntu-24.04-aarch64-2026.07.17-0`; explicit selection was rejected because the public image has empty `compartment-id`. Selector discovery succeeded. A real `start` then returned `no_capacity` with blank stderr text; no instance was created.
+
+---
+
+## Problem 33 — Expose durable state path and next retry in start results
+
+**Status:** In Progress
+
+### Problem
+
+Make a provisioning run self-explanatory and easy to resume or inspect.
+
+### Task
+
+* Add durable state path, lifecycle and next-attempt timestamp to typed start results when state exists.
+* Include the fields in both text and `ocihood.start/v1` JSON output with parity tests.
+* Report whether the run is resumable without exposing attempt IDs, retry tokens or credentials.
+* Keep stdout machine-readable and diagnostics on stderr.
+* Preserve existing exit codes and reconciliation semantics.
+
+---
+
+## Problem 34 — Make status work after configless provisioning runs
+
+**Status:** Duplicate
+
+### Problem
+
+Allow users who ran OCIHood entirely through CLI flags to inspect the resulting durable state without first creating project YAML.
+
+### Task
+
+* Support `ocihood status --account <name>` against the built-in default state directory without loading project YAML.
+* Add an explicit `--state-dir` override matching `start`.
+* Preserve fail-safe behavior when multiple targets exist; accept an explicit TargetID selector instead of guessing.
+
+---
+
+## Problem 35 — Support Telegram notifications in configless runs and add a delivery test command
+
+**Status:** Todo
+
+### Problem
+
+Make Telegram usable and verifiable without requiring OCIHood YAML.
+
+### Task
+
+* Add configless notification overrides for enabled/disabled, chat ID and token environment-variable name.
+* Never accept a raw bot token as a CLI flag and never persist or print token contents.
+* Preserve normal config precedence: explicit flags over account/global config over disabled default.
+* Add `ocihood notifications test` that sends one clearly identified test event without authenticating to OCI or starting provisioning.
+* Report delivery success/failure through stable text/JSON output and exit codes.
+* Bound requests with context and timeout.
+
+---
+
+## Problem 36 — Emit one terminal run-finished notification for every provisioning outcome
+
+**Status:** Todo
+
+### Problem
+
+Give users an unambiguous terminal notification matching every completed foreground run.
+
+### Task
+
+* Add a typed `run_finished` event emitted exactly once for success, already-satisfied, no-capacity, paused/deadline, canceled, retryable failure and fatal failure.
+* Include account, region, TargetID, sanitized outcome and exit category; include instance/public IP only when available.
+* Keep transition events such as waiting, paused and instance-running, but prevent duplicate terminal messages.
+* Notification delivery remains best-effort and must not change provisioning outcome.
+* Preserve secret redaction and bounded notification timeout.
+
+---
+
+## Problem 37 — Reduce required OCI selectors with safe read-only defaults
+
+**Status:** Todo
+
+### Problem
+
+Let a new user reach a deterministic plan without manually collecting compartment, VCN and subnet identifiers when OCI can resolve them safely.
+
+### Task
+
+* When no target compartment is configured, default to the authenticated root tenancy only when that identity is unambiguous and authorized.
+* When exactly one compatible VCN and exactly one compatible subnet exist, select them automatically.
+* Never guess when zero or multiple compatible candidates exist; return an actionable error listing non-secret candidate names and the exact flag/config field required.
+* Surface every automatic selection in text and JSON plan output before any mutation.
+* Reuse the existing read-only discovery path; do not add mutating network setup.
+* Let the config wizard detect common SSH public-key candidates and require explicit confirmation before saving one.
+
+---
+
+## Problem 38 — Add cross-platform setup and dependency readiness automation
+
+**Status:** Todo
+
+### Problem
+
+Give users one safe setup command that detects the local platform, verifies every real OCIHood prerequisite and installs or updates missing optional dependencies from official sources.
+
+### Task
+
+* Add `ocihood setup check` that detects OS, distribution, architecture, shell and available package managers.
+* Maintain an explicit typed dependency manifest classifying each item as:
+  * required runtime;
+  * optional operational;
+  * development-only.
+* Check at least:
+  * OCI API config/profile and signing-key file;
+  * writable OCIHood config/state directories;
+  * OCI CLI;
+* Report installed version, supported version/range, source and status: pass, missing, outdated, unsupported, skipped.
+* Add `ocihood setup install` and `ocihood setup update` for supported platforms.
+* Install only missing/outdated optional or development dependencies selected by the user; never install unrelated tools.
+* Require explicit confirmation before package-manager, PATH, shell-profile, privilege or system-wide changes. Support a non-interactive `--yes` mode with the complete planned actions printed first.
+* Resolve the newest compatible stable version at execution time, not prerelease/nightly. Respect project-pinned versions where reproducibility matters.
+* Use official package repositories/releases/installers and verify checksums/signatures where the upstream publishes them.
+* Never execute downloaded scripts blindly, never use unverified mirrors and never request/store OCI or Telegram secrets.
+* Support macOS arm64/amd64 first plus documented Linux distributions used by release artifacts. Unsupported systems must fail with manual instructions rather than guessing.
+* Provide deterministic text/JSON output and documented exit codes.
+* Add `--dry-run` showing exact changes, commands, versions and download sources without modifying the host.
+* Reuse readiness checks from Problem 26 where applicable; do not duplicate OCI/provider diagnostics.
+
+---
+
